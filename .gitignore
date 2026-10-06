@@ -1,0 +1,19 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Generated output — not templates
+data/output/
+data/slidestein.db
+data/lancedb/
+
+# Keep template slides out of version control unless explicitly added
+data/slides/*
+!data/slides/.gitkeep
