@@ -47,10 +47,54 @@ class PPTMasterAdapter(ABC):
         ...
 
     @abstractmethod
-    def render_preview(self, pptx_path: Path, output_dir: Path) -> Path:
-        """Render the first slide of pptx_path to a PNG in output_dir.
+    def render_preview(
+        self,
+        pptx_path: Path,
+        slide_number: int,
+        output_path: Path,
+    ) -> Path:
+        """Render slide_number (1-indexed) of pptx_path to a PNG at output_path.
 
-        Used by the vision-selection and visual-QA stages.
-        Returns the path to the PNG file.
+        Used by the ingestion pipeline, vision-selection, and visual-QA stages.
+        output_path's parent directory must exist or be created by the implementation.
+        Returns output_path on success.
         """
         ...
+
+    # ------------------------------------------------------------------
+    # Roundtrip operations — concrete default raises NotImplementedError
+    # so existing subclasses are not broken.
+    # ------------------------------------------------------------------
+
+    def extract_slide(
+        self,
+        source_pptx: Path,
+        slide_number: int,
+        output_path: Path,
+    ) -> Path:
+        """Extract a single slide preserving native PPTX objects.
+
+        The default implementation raises NotImplementedError.
+        Override in adapters that support native roundtrip (e.g. PPTMasterRealAdapter).
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support native slide extraction. "
+            "Use PPTMasterRealAdapter."
+        )
+
+    def replace_text_in_slide(
+        self,
+        source_pptx: Path,
+        slide_number: int,
+        replacements: dict[str, str],
+        output_path: Path,
+    ) -> Path:
+        """Replace text in a slide and export an editable PPTX.
+
+        replacements maps old_text → new_text; only exact literal matches are replaced.
+        The default implementation raises NotImplementedError.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support native text replacement. "
+            "Use PPTMasterRealAdapter."
+        )

@@ -1,4 +1,4 @@
-"""Tests for the PPTMasterAdapter ABC and StubPPTMasterAdapter."""
+"""Tests for the PPTMasterAdapter ABC, StubPPTMasterAdapter, and PythonPptxAdapter."""
 
 from __future__ import annotations
 
@@ -34,40 +34,33 @@ class TestPPTMasterAdapterIsAbstract:
             def fill_and_export(self, template_path, slots, output_path):
                 return output_path
 
-            def render_preview(self, pptx_path, output_dir):
-                return output_dir / "preview.png"
+            def render_preview(self, pptx_path, slide_number, output_path):
+                return output_path
 
         adapter = Concrete()
         assert isinstance(adapter, PPTMasterAdapter)
 
 
 class TestStubPPTMasterAdapter:
-    """Integration-light tests — use an in-memory PPTX where possible."""
-
     def test_fill_and_export_writes_file(self, tmp_path):
-        """fill_and_export creates an output file when given a valid template."""
         from pptx import Presentation
 
         pytest.importorskip("pptx")
 
-        from slidestein.domain.models import ContentSlotType
         from slidestein.pptx.stub import StubPPTMasterAdapter
 
-        # Build a minimal in-memory PPTX with a title placeholder
         prs = Presentation()
-        layout = prs.slide_layouts[0]  # Title Slide layout has two placeholders
+        layout = prs.slide_layouts[0]
         prs.slides.add_slide(layout)
         template_path = tmp_path / "template.pptx"
         prs.save(str(template_path))
 
         adapter = StubPPTMasterAdapter()
 
-        # Introspect
         metadata = adapter.introspect_template(template_path)
-        assert metadata.slide_id  # non-empty
+        assert metadata.slide_id
         assert len(metadata.content_slots) > 0
 
-        # Fill
         title_slot = metadata.content_slots[0]
         filled_slot = title_slot.model_copy(update={"value": "Test Title"})
 
@@ -81,4 +74,86 @@ class TestStubPPTMasterAdapter:
 
         adapter = StubPPTMasterAdapter()
         with pytest.raises(NotImplementedError):
-            adapter.render_preview(tmp_path / "slide.pptx", tmp_path)
+            adapter.render_preview(tmp_path / "slide.pptx", 1, tmp_path / "out.png")
+
+
+class TestPythonPptxAdapterRenderingBackends:
+    """Unit tests for the module-level rendering helpers."""
+
+    def test_find_soffice_returns_none_when_absent(self, monkeypatch):
+        """If soffice is not on PATH and not at the default Windows location,
+        _find_soffice must return None."""
+        from unittest.mock import patch
+
+        from slidestein.pptx import python_pptx_adapter as m
+
+        with (
+            patch.object(m, "_find_soffice", return_value=None),
+        ):
+            assert m._find_soffice() is None  # type: ignore[comparison-overlap]
+
+    def test_render_via_powerpoint_com_returns_false_when_comtypes_missing(
+        self, tmp_path, monkeypatch
+    ):
+        import builtins
+
+        real_import = builtins.__import__
+
+        def _block_comtypes(name, *args, **kwargs):
+            if name.startswith("comtypes"):
+                raise ImportError("comtypes not available")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", _block_comtypes)
+
+        from slidestein.pptx.python_pptx_adapter import _render_via_powerpoint_com
+
+        result = _render_via_powerpoint_com(
+            tmp_path / "x.pptx", 1, tmp_path / "out.png"
+        )
+        assert result is False
+
+    def test_render_via_libreoffice_returns_false_when_soffice_absent(
+        self, tmp_path, monkeypatch
+    ):
+        from unittest.mock import patch
+
+        from slidestein.pptx import python_pptx_adapter as m
+
+        with patch.object(m, "_find_soffice", return_value=None):
+            result = m._render_via_libreoffice(
+                tmp_path / "x.pptx", 1, tmp_path / "out.png"
+            )
+        assert result is False
+
+    def test_render_preview_raises_runtime_error_when_no_backends(
+        self, tmp_path, monkeypatch
+    ):
+        from unittest.mock import patch
+
+        from slidestein.pptx import python_pptx_adapter as m
+
+        with (
+            patch.object(m, "_render_via_powerpoint_com", return_value=False),
+            patch.object(m, "_render_via_libreoffice", return_value=False),
+        ):
+            adapter = m.PythonPptxAdapter()
+            with pytest.raises(RuntimeError, match="No preview rendering backend"):
+                adapter.render_preview(tmp_path / "x.pptx", 1, tmp_path / "out.png")
+
+
+@pytest.mark.integration
+class TestPythonPptxAdapterIntegration:
+    """Requires a rendering backend (PowerPoint or LibreOffice) to be installed.
+    Run with: pytest -m integration
+    """
+
+    def test_render_preview_produces_png(self, tmp_path, three_slide_pptx):
+        from slidestein.pptx.python_pptx_adapter import PythonPptxAdapter
+
+        adapter = PythonPptxAdapter()
+        out = tmp_path / "preview.png"
+        result = adapter.render_preview(three_slide_pptx, slide_number=1, output_path=out)
+        assert result == out
+        assert out.exists()
+        assert out.stat().st_size > 0

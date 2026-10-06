@@ -17,3 +17,10 @@ data/lancedb/
 # Keep template slides out of version control unless explicitly added
 data/slides/*
 !data/slides/.gitkeep
+
+# Local test decks
+data/test_decks/*.pptx
+
+# Generated previews and outputs
+data/previews/
+outputs/

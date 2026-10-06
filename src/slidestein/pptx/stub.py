@@ -1,8 +1,9 @@
 """StubPPTMasterAdapter — development fallback using python-pptx directly.
 
-Replace this with a real PPTMasterAdapter once PPT Master is available.
-This stub satisfies the full contract so every other pipeline stage can be
-developed and tested without PPT Master being installed.
+Use PythonPptxAdapter for any workflow that requires preview rendering.
+This stub intentionally raises NotImplementedError for render_preview so that
+tests that wire up the generation pipeline without a rendering backend still
+have explicit, readable failure points.
 """
 
 from __future__ import annotations
@@ -11,7 +12,6 @@ import hashlib
 from pathlib import Path
 
 from pptx import Presentation
-from pptx.util import Pt
 
 from slidestein.domain.models import (
     CommunicationJob,
@@ -22,15 +22,16 @@ from slidestein.domain.models import (
 )
 from slidestein.pptx.adapter import PPTMasterAdapter
 
-# Placeholder archetype and job — a real adapter would read these from
-# custom document properties or a sidecar JSON file.
 _DEFAULT_ARCHETYPE = VisualArchetype.TITLE_ONLY
 _DEFAULT_JOBS = [CommunicationJob.INFORM]
 
 
 class StubPPTMasterAdapter(PPTMasterAdapter):
-    """python-pptx-backed stub.  Sufficient for wiring up the pipeline;
-    not suitable for production use with complex slide masters."""
+    """python-pptx-backed stub.
+
+    Sufficient for wiring up the generation pipeline in tests; not suitable
+    for production ingestion (no preview rendering).
+    """
 
     def introspect_template(self, template_path: Path) -> SlideMetadata:
         prs = Presentation(str(template_path))
@@ -78,12 +79,16 @@ class StubPPTMasterAdapter(PPTMasterAdapter):
         prs.save(str(output_path))
         return output_path
 
-    def render_preview(self, pptx_path: Path, output_dir: Path) -> Path:
-        # Real implementation: LibreOffice headless on Linux/macOS, or
-        # comtypes / win32com on Windows.
+    def render_preview(
+        self,
+        pptx_path: Path,
+        slide_number: int,
+        output_path: Path,
+    ) -> Path:
         raise NotImplementedError(
-            "Preview rendering requires LibreOffice or a COM bridge. "
-            "Install LibreOffice and implement via subprocess, or use comtypes on Windows."
+            "Preview rendering is not implemented in StubPPTMasterAdapter. "
+            "Use PythonPptxAdapter (which tries PowerPoint COM or LibreOffice), "
+            "or pass render_previews=False to IngestionService."
         )
 
 

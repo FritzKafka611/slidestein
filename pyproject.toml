@@ -11,6 +11,7 @@ dependencies = [
     "rich>=13.9.0",
     "python-pptx>=1.0.0",
     "lancedb>=0.13.0",
+    "comtypes>=1.4.17",
 ]
 
 [project.scripts]
@@ -32,3 +33,6 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+    "integration: requires PowerPoint or LibreOffice to be installed (deselect with -m 'not integration')",
+]
