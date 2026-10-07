@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import io
 import shutil
+import struct
 import uuid
+import zipfile
+import zlib
 from pathlib import Path
 
 import pytest
 from pptx import Presentation
-from pptx.util import Pt
+from pptx.util import Emu, Pt
 
 from slidestein.identity.slide_identity import (
     compute_content_fingerprint,
@@ -38,6 +42,51 @@ def _make_pptx(path: Path, n_slides: int = 3, add_text: bool = True) -> Path:
                     ph.text = f"Subtitle {i}"
     prs.save(str(path))
     return path
+
+
+def _make_minimal_png(r: int = 128, g: int = 128, b: int = 128) -> bytes:
+    """Return a 1×1 pixel RGB PNG with the given colour."""
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        crc = zlib.crc32(tag + data) & 0xFFFFFFFF
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", crc)
+
+    ihdr_data = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+    raw_row   = bytes([0, r, g, b])  # filter byte (none) + RGB
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", ihdr_data)
+        + chunk(b"IDAT", zlib.compress(raw_row))
+        + chunk(b"IEND", b"")
+    )
+
+
+def _make_pptx_with_image(path: Path, png_bytes: bytes) -> None:
+    """Save a 1-slide PPTX with a single embedded picture."""
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])  # blank layout
+    img_stream = io.BytesIO(png_bytes)
+    slide.shapes.add_picture(img_stream, Emu(914400), Emu(914400), Emu(914400), Emu(914400))
+    prs.save(str(path))
+
+
+def _replace_image_in_pptx(src_path: Path, dest_path: Path, new_png: bytes) -> None:
+    """Copy src_path → dest_path, replacing the first image in ppt/media/ with new_png."""
+    with zipfile.ZipFile(src_path, "r") as z:
+        entries = {name: z.read(name) for name in z.namelist()}
+
+    media_names = sorted(
+        n for n in entries if n.startswith("ppt/media/")
+    )
+    if not media_names:
+        raise ValueError("No media found in PPTX")
+
+    entries[media_names[0]] = new_png
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, data in entries.items():
+            z.writestr(name, data)
+    dest_path.write_bytes(buf.getvalue())
 
 
 # ---------------------------------------------------------------------------
@@ -250,3 +299,94 @@ class TestInputFingerprint:
         fp = compute_input_fingerprint("slide", "c", "s", "1.0", "1.0")
         assert len(fp) == 64
         assert all(c in "0123456789abcdef" for c in fp)
+
+
+# ---------------------------------------------------------------------------
+# M3.4.1 Fix 3 — strengthened content_fingerprint (image replacement)
+# ---------------------------------------------------------------------------
+
+
+class TestContentFingerprintStrengthened:
+    """Verify that compute_content_fingerprint detects image swaps and that
+    text-only slides remain unchanged (backward compat for existing records)."""
+
+    def test_fingerprint_changes_after_image_replacement(self, tmp_path):
+        """Replacing image bytes with different content must change the fingerprint."""
+        png_red   = _make_minimal_png(r=255, g=0, b=0)
+        png_blue  = _make_minimal_png(r=0, g=0, b=255)
+
+        src_path  = tmp_path / "with_red.pptx"
+        dest_path = tmp_path / "with_blue.pptx"
+
+        _make_pptx_with_image(src_path, png_red)
+        _replace_image_in_pptx(src_path, dest_path, png_blue)
+
+        ids_src  = extract_slide_identities(src_path)
+        ids_dest = extract_slide_identities(dest_path)
+
+        fp_src  = compute_content_fingerprint(src_path,  ids_src[0].slide_part)
+        fp_dest = compute_content_fingerprint(dest_path, ids_dest[0].slide_part)
+
+        assert fp_src != fp_dest, "fingerprint must change when image bytes change"
+
+    def test_fingerprint_stable_for_same_image(self, tmp_path):
+        """Two PPTX files with the same image bytes produce the same fingerprint."""
+        png = _make_minimal_png(r=100, g=150, b=200)
+        path1 = tmp_path / "a.pptx"
+        path2 = tmp_path / "b.pptx"
+        _make_pptx_with_image(path1, png)
+        _make_pptx_with_image(path2, png)
+
+        ids1 = extract_slide_identities(path1)
+        ids2 = extract_slide_identities(path2)
+
+        fp1 = compute_content_fingerprint(path1, ids1[0].slide_part)
+        fp2 = compute_content_fingerprint(path2, ids2[0].slide_part)
+
+        assert fp1 == fp2
+
+    def test_text_only_slide_fingerprint_unchanged_vs_v1(self, three_slide_pptx):
+        """For text-only slides (no images/charts), fingerprint equals SHA-256 of
+        slide XML — same as the original v1 algorithm.  Existing records stay valid."""
+        import hashlib
+        import zipfile as zf
+
+        ids = extract_slide_identities(three_slide_pptx)
+        slide_part = ids[0].slide_part
+
+        # v1 result: raw SHA-256 of slide XML only.
+        with zf.ZipFile(three_slide_pptx, "r") as z:
+            xml_bytes = z.read(f"ppt/{slide_part}")
+        v1_fp = hashlib.sha256(xml_bytes).hexdigest()
+
+        # v2 result: should equal v1 when no renderable relationships exist.
+        v2_fp = compute_content_fingerprint(three_slide_pptx, slide_part)
+
+        assert v1_fp == v2_fp, "text-only slide fingerprint must not change in v2"
+
+    def test_unrelated_slide_edit_does_not_change_other_fingerprint(
+        self, three_slide_pptx, tmp_path
+    ):
+        """An edit to slide 2 must not change slide 1's content_fingerprint."""
+        ids_before = extract_slide_identities(three_slide_pptx)
+        fp_slide1_before = compute_content_fingerprint(
+            three_slide_pptx, ids_before[0].slide_part
+        )
+
+        edited = tmp_path / "edited.pptx"
+        shutil.copy(three_slide_pptx, edited)
+        prs = Presentation(str(edited))
+        # Edit only slide 2.
+        for ph in prs.slides[1].placeholders:
+            if ph.placeholder_format.idx == 0:
+                ph.text = "Completely Different Slide 2 Title"
+        prs.save(str(edited))
+
+        ids_after = extract_slide_identities(edited)
+        fp_slide1_after = compute_content_fingerprint(
+            edited, ids_after[0].slide_part
+        )
+
+        assert fp_slide1_before == fp_slide1_after, (
+            "editing slide 2 must not change slide 1's content fingerprint"
+        )

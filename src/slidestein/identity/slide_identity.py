@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import posixpath
 import uuid
 import zipfile
 import xml.etree.ElementTree as ET
@@ -23,6 +24,17 @@ _NS_REL = "http://schemas.openxmlformats.org/package/2006/relationships"
 _SLIDE_REL_TYPE = (
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide"
 )
+
+# Relationship types whose referenced parts materially affect slide rendering.
+# Theme, master, and layout references are excluded (deck-global, not slide-local).
+_RENDERABLE_REL_TYPES = frozenset({
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image",
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart",
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData",
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramLayout",
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramQuickStyle",
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramColors",
+})
 
 
 @dataclass(frozen=True)
@@ -113,14 +125,90 @@ def compute_deck_fingerprint(pptx_path: Path) -> str:
     return hashlib.sha256(pptx_path.read_bytes()).hexdigest()
 
 
-def compute_content_fingerprint(pptx_path: Path, slide_part: str) -> str:
-    """SHA-256 of the raw slide XML bytes from the PPTX zip.
+def _rels_zip_path(slide_part: str) -> str:
+    """Return the ZIP path for the relationship sidecar of a slide part.
 
-    slide_part is relative to the ppt/ directory, e.g. "slides/slide1.xml".
+    "slides/slide1.xml"  →  "ppt/slides/_rels/slide1.xml.rels"
+    """
+    dir_part, file_part = (
+        slide_part.rsplit("/", 1) if "/" in slide_part else ("", slide_part)
+    )
+    if dir_part:
+        return f"ppt/{dir_part}/_rels/{file_part}.rels"
+    return f"ppt/_rels/{file_part}.rels"
+
+
+def _resolve_rel_target(slide_part: str, target: str) -> str:
+    """Resolve a relationship target to an absolute ZIP path.
+
+    slide_part : "slides/slide1.xml"
+    target     : "../media/image1.png"  →  "ppt/media/image1.png"
+    """
+    if target.startswith("/"):
+        return target.lstrip("/")
+    slide_dir = "ppt/" + "/".join(slide_part.split("/")[:-1]) + "/"
+    return posixpath.normpath(posixpath.join(slide_dir, target))
+
+
+def compute_content_fingerprint(pptx_path: Path, slide_part: str) -> str:
+    """SHA-256 fingerprint of a slide's visible content.
+
+    Algorithm (Content Fingerprint v2):
+        1.  slide_xml_hash  = SHA-256(raw bytes of ppt/<slide_part>)
+        2.  Parse ppt/slides/_rels/<slideN>.xml.rels (if present).
+        3.  For each Relationship whose Type is in _RENDERABLE_REL_TYPES
+            (image, chart, diagramData, diagramLayout, diagramQuickStyle,
+            diagramColors):
+            a.  Resolve Target to an absolute ZIP path.
+            b.  part_hash = SHA-256(referenced part bytes).
+            c.  Collect entry (rel_type, resolved_zip_path, part_hash).
+        4.  Sort entries lexicographically by (rel_type, resolved_zip_path).
+        5.  If no entries:  return slide_xml_hash.
+            (Unchanged from v1 for text-only slides — no backward-compat break.)
+            Else: return SHA-256(
+                slide_xml_hash
+                + "::" + "::".join(f"{rt}:{p}:{h}" for rt, p, h in entries)
+            )
+
+    Theme, master, and layout references are excluded (deck-global assets whose
+    changes should not invalidate individual slide classifications).
     """
     with zipfile.ZipFile(pptx_path, "r") as z:
-        data = z.read(f"ppt/{slide_part}")
-    return hashlib.sha256(data).hexdigest()
+        zip_names = set(z.namelist())
+
+        # Step 1: hash raw slide XML.
+        slide_bytes = z.read(f"ppt/{slide_part}")
+        slide_xml_hash = hashlib.sha256(slide_bytes).hexdigest()
+
+        # Step 2: parse slide relationship sidecar.
+        rels_path = _rels_zip_path(slide_part)
+        entries: list[tuple[str, str, str]] = []
+
+        if rels_path in zip_names:
+            rels_root = ET.fromstring(z.read(rels_path))
+            for rel in rels_root.findall(f"{{{_NS_REL}}}Relationship"):
+                rel_type = rel.get("Type", "")
+                if rel_type not in _RENDERABLE_REL_TYPES:
+                    continue
+                target = rel.get("Target", "")
+                resolved = _resolve_rel_target(slide_part, target)
+                if resolved not in zip_names:
+                    continue
+                part_hash = hashlib.sha256(z.read(resolved)).hexdigest()
+                entries.append((rel_type, resolved, part_hash))
+
+        # Step 3: sort for determinism.
+        entries.sort()
+
+        # Step 4: combine.
+        if not entries:
+            return slide_xml_hash
+
+        h = hashlib.sha256()
+        h.update(slide_xml_hash.encode("utf-8"))
+        for rel_type, resolved_path, part_hash in entries:
+            h.update(f"::{rel_type}:{resolved_path}:{part_hash}".encode("utf-8"))
+        return h.hexdigest()
 
 
 def compute_structure_fingerprint(pptx_path: Path, slide_number: int) -> str:
