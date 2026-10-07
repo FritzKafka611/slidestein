@@ -399,13 +399,18 @@ class TestClassificationPersistence:
         lib.close()
 
     def test_count_current_classifications_only_counts_active_slides(self, tmp_path):
+        from slidestein.identity.slide_identity import compute_input_fingerprint
         lib = _make_library(tmp_path)
-        # Add active record with a classification
-        lib.upsert_record(_make_record("s1", slide_number=1, is_active=True))
-        lib.upsert_classification("s1", "1.0", "model", "1.0", "fp", _valid_profile("s1"))
-        # Add inactive record with a classification
-        lib.upsert_record(_make_record("s2", slide_number=2, is_active=False))
-        lib.upsert_classification("s2", "1.0", "model", "1.0", "fp", _valid_profile("s2"))
+        # Active record — correct input_fingerprint.
+        lib.upsert_record(_make_record("s1", slide_number=1, is_active=True,
+                                       content_fp="cfp", structure_fp="sfp"))
+        input_fp1 = compute_input_fingerprint("s1", "cfp", "sfp", "1.0", "1.0")
+        lib.upsert_classification("s1", "1.0", "model", "1.0", input_fp1, _valid_profile("s1"))
+        # Inactive record with a correct classification.
+        lib.upsert_record(_make_record("s2", slide_number=2, is_active=False,
+                                       content_fp="cfp2", structure_fp="sfp2"))
+        input_fp2 = compute_input_fingerprint("s2", "cfp2", "sfp2", "1.0", "1.0")
+        lib.upsert_classification("s2", "1.0", "model", "1.0", input_fp2, _valid_profile("s2"))
 
         count = lib.count_current_classifications("1.0")
         lib.close()
@@ -426,9 +431,201 @@ class TestClassificationPersistence:
         assert "s2" not in ids
 
     def test_count_classified_records_delegates_to_current(self, tmp_path):
+        from slidestein.identity.slide_identity import compute_input_fingerprint
         lib = _make_library(tmp_path)
-        lib.upsert_record(_make_record("s1", slide_number=1, is_active=True))
-        lib.upsert_classification("s1", CLASSIFICATION_VERSION, "m", "1.0", "fp", _valid_profile("s1"))
+        lib.upsert_record(_make_record("s1", slide_number=1, is_active=True,
+                                       content_fp="cfp", structure_fp="sfp"))
+        input_fp = compute_input_fingerprint("s1", "cfp", "sfp", CLASSIFICATION_VERSION, "1.0")
+        lib.upsert_classification("s1", CLASSIFICATION_VERSION, "m", "1.0", input_fp, _valid_profile("s1"))
         count = lib.count_classified_records()
         lib.close()
         assert count == 1
+
+
+# ---------------------------------------------------------------------------
+# M3.4.1 Fix 2 — stale classification counting
+# ---------------------------------------------------------------------------
+
+
+class TestStaleClassificationCounting:
+    """count_current_classifications must verify input_fingerprint, not just existence."""
+
+    def _store_current_classification(
+        self,
+        lib,
+        slide_id: str,
+        content_fp: str,
+        structure_fp: str,
+        prompt_version: str = "1.0",
+    ) -> str:
+        """Upsert a classification whose input_fingerprint exactly matches the record."""
+        from slidestein.identity.slide_identity import compute_input_fingerprint
+        input_fp = compute_input_fingerprint(
+            slide_id, content_fp, structure_fp, CLASSIFICATION_VERSION, prompt_version
+        )
+        lib.upsert_classification(
+            slide_id, CLASSIFICATION_VERSION, "model", prompt_version, input_fp,
+            _valid_profile(slide_id),
+        )
+        return input_fp
+
+    def test_matching_fingerprint_counted(self, tmp_path):
+        lib = _make_library(tmp_path)
+        lib.upsert_record(_make_record(
+            "s1", slide_number=1, is_active=True,
+            content_fp="cfp-orig", structure_fp="sfp-orig",
+        ))
+        self._store_current_classification(lib, "s1", "cfp-orig", "sfp-orig")
+        assert lib.count_current_classifications(CLASSIFICATION_VERSION) == 1
+        lib.close()
+
+    def test_stale_content_fingerprint_not_counted(self, tmp_path):
+        lib = _make_library(tmp_path)
+        lib.upsert_record(_make_record(
+            "s1", slide_number=1, is_active=True,
+            content_fp="cfp-orig", structure_fp="sfp-orig",
+        ))
+        self._store_current_classification(lib, "s1", "cfp-orig", "sfp-orig")
+        assert lib.count_current_classifications(CLASSIFICATION_VERSION) == 1
+
+        # Simulate a content edit: replace record with new content_fingerprint.
+        lib.upsert_record(_make_record(
+            "s1", slide_number=1, is_active=True,
+            content_fp="cfp-CHANGED", structure_fp="sfp-orig",
+        ))
+        assert lib.count_current_classifications(CLASSIFICATION_VERSION) == 0
+        lib.close()
+
+    def test_stale_structure_fingerprint_not_counted(self, tmp_path):
+        lib = _make_library(tmp_path)
+        lib.upsert_record(_make_record(
+            "s1", slide_number=1, is_active=True,
+            content_fp="cfp-orig", structure_fp="sfp-orig",
+        ))
+        self._store_current_classification(lib, "s1", "cfp-orig", "sfp-orig")
+
+        lib.upsert_record(_make_record(
+            "s1", slide_number=1, is_active=True,
+            content_fp="cfp-orig", structure_fp="sfp-CHANGED",
+        ))
+        assert lib.count_current_classifications(CLASSIFICATION_VERSION) == 0
+        lib.close()
+
+    def test_inactive_slide_not_counted(self, tmp_path):
+        lib = _make_library(tmp_path)
+        lib.upsert_record(_make_record(
+            "s1", slide_number=1, is_active=True,
+            content_fp="cfp-orig", structure_fp="sfp-orig",
+        ))
+        self._store_current_classification(lib, "s1", "cfp-orig", "sfp-orig")
+        assert lib.count_current_classifications(CLASSIFICATION_VERSION) == 1
+
+        # Mark inactive.
+        lib.mark_slides_inactive(deck_fingerprint="abc123")
+        assert lib.count_current_classifications(CLASSIFICATION_VERSION) == 0
+        lib.close()
+
+    def test_wrong_classification_version_not_counted(self, tmp_path):
+        lib = _make_library(tmp_path)
+        lib.upsert_record(_make_record(
+            "s1", slide_number=1, is_active=True,
+            content_fp="cfp-orig", structure_fp="sfp-orig",
+        ))
+        self._store_current_classification(lib, "s1", "cfp-orig", "sfp-orig")
+        # Query for a different version — should find nothing.
+        assert lib.count_current_classifications("2.0") == 0
+        lib.close()
+
+    def test_stale_prompt_version_not_counted(self, tmp_path):
+        """A classification stored with prompt v1.0 is stale if prompt is now v2.0."""
+        from slidestein.identity.slide_identity import compute_input_fingerprint
+        lib = _make_library(tmp_path)
+        lib.upsert_record(_make_record(
+            "s1", slide_number=1, is_active=True,
+            content_fp="cfp-orig", structure_fp="sfp-orig",
+        ))
+        # Store classification with prompt_version="1.0".
+        self._store_current_classification(lib, "s1", "cfp-orig", "sfp-orig", prompt_version="1.0")
+        assert lib.count_current_classifications(CLASSIFICATION_VERSION) == 1
+
+        # Now simulate a prompt bump: re-store with prompt_version="2.0",
+        # which generates a DIFFERENT input_fingerprint.
+        input_fp_v2 = compute_input_fingerprint(
+            "s1", "cfp-orig", "sfp-orig", CLASSIFICATION_VERSION, "2.0"
+        )
+        lib.upsert_classification(
+            "s1", CLASSIFICATION_VERSION, "model", "2.0", input_fp_v2,
+            _valid_profile("s1"),
+        )
+        # The stored input_fp now uses prompt_version=2.0 → matches → still counted.
+        assert lib.count_current_classifications(CLASSIFICATION_VERSION) == 1
+
+        # If we manually corrupt the stored fp, it should drop to 0.
+        lib._get_conn().execute(
+            "UPDATE slide_classifications SET input_fingerprint = 'corrupted-fp'",
+        )
+        lib._get_conn().commit()
+        assert lib.count_current_classifications(CLASSIFICATION_VERSION) == 0
+        lib.close()
+
+    def test_null_fingerprints_excluded_from_count(self, tmp_path):
+        """Legacy records with NULL content/structure fingerprints are never counted."""
+        lib = _make_library(tmp_path)
+        # Record without content/structure fingerprints (legacy).
+        lib.upsert_record(_make_record("s1", slide_number=1, is_active=True))
+        lib.upsert_classification(
+            "s1", CLASSIFICATION_VERSION, "model", "1.0", "any-fp",
+            _valid_profile("s1"),
+        )
+        assert lib.count_current_classifications(CLASSIFICATION_VERSION) == 0
+        lib.close()
+
+
+# ---------------------------------------------------------------------------
+# M3.4.1 Fix 6 — classification version coexistence
+# ---------------------------------------------------------------------------
+
+
+class TestClassificationVersionCoexistence:
+    """UNIQUE(slide_id, classification_version) allows v1.0 and v2.0 to coexist."""
+
+    def test_two_versions_coexist(self, tmp_path):
+        lib = _make_library(tmp_path)
+        profile = _valid_profile("slide-x")
+        lib.upsert_classification("slide-x", "1.0", "model-a", "1.0", "fp-1", profile)
+        lib.upsert_classification("slide-x", "2.0", "model-b", "1.0", "fp-2", profile)
+
+        v1 = lib.get_classification("slide-x", "1.0")
+        v2 = lib.get_classification("slide-x", "2.0")
+        lib.close()
+
+        assert v1 is not None and v1.model == "model-a"
+        assert v2 is not None and v2.model == "model-b"
+        assert v1.input_fingerprint != v2.input_fingerprint
+
+    def test_same_version_upsert_replaces(self, tmp_path):
+        lib = _make_library(tmp_path)
+        profile = _valid_profile("slide-y")
+        lib.upsert_classification("slide-y", "1.0", "first",  "1.0", "fp-a", profile)
+        lib.upsert_classification("slide-y", "1.0", "second", "1.0", "fp-b", profile)
+
+        loaded = lib.get_classification("slide-y", "1.0")
+        lib.close()
+
+        assert loaded is not None
+        assert loaded.model == "second"
+        assert loaded.input_fingerprint == "fp-b"
+
+    def test_three_versions_all_distinct(self, tmp_path):
+        lib = _make_library(tmp_path)
+        profile = _valid_profile("slide-z")
+        for v in ["1.0", "2.0", "3.0"]:
+            lib.upsert_classification("slide-z", v, f"model-{v}", "1.0", f"fp-{v}", profile)
+
+        rows = lib._get_conn().execute(
+            "SELECT classification_version FROM slide_classifications WHERE slide_id = 'slide-z'"
+        ).fetchall()
+        lib.close()
+
+        versions = {r[0] for r in rows}
+        assert versions == {"1.0", "2.0", "3.0"}

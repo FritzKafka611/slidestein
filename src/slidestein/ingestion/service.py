@@ -91,7 +91,9 @@ class IngestionService:
         deck_id = _resolve_deck_id(self._library, pptx_path, deck_fingerprint)
 
         # Mark all current active slides for this deck inactive before re-inserting.
-        self._library.mark_slides_inactive(deck_fingerprint=deck_fingerprint)
+        # Use deck_id (not deck_fingerprint) so edits to the file — which change
+        # the fingerprint — still retire the correct prior slides.
+        self._library.mark_slides_inactive(deck_id=deck_id)
 
         # Extract native slide identities from OOXML.
         try:

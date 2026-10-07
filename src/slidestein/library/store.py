@@ -249,11 +249,15 @@ class SlideLibrary:
 
     def get_record(self, slide_id: str) -> SlideRecord | None:
         row = self._get_conn().execute(
-            "SELECT record_json FROM slide_records WHERE slide_id = ?", (slide_id,)
+            "SELECT record_json, is_active FROM slide_records WHERE slide_id = ?",
+            (slide_id,),
         ).fetchone()
         if row is None:
             return None
-        return SlideRecord.model_validate_json(row[0])
+        record = SlideRecord.model_validate_json(row[0])
+        # Override is_active from the live column — record_json may be stale if
+        # mark_slides_inactive ran after the last upsert.
+        return record.model_copy(update={"is_active": bool(row[1])})
 
     def get_slide(self, slide_id: str) -> SlideRecord | None:
         """Alias for get_record."""
@@ -461,19 +465,45 @@ class SlideLibrary:
         return row[0] == current_input_fp
 
     def count_current_classifications(self, version: str) -> int:
-        """Count active slides that have a current (non-stale) classification."""
-        row = self._get_conn().execute(
+        """Count active slides whose classification input_fingerprint is still current.
+
+        A classification is current only when the stored input_fingerprint equals
+        compute_input_fingerprint(slide_id, content_fp, structure_fp, version, prompt_version).
+        Slides whose content/structure fingerprints are NULL (legacy records without
+        M3.4 identity) are excluded — they cannot be verified and are never counted.
+        """
+        # Deferred import to avoid a circular dependency at module load time.
+        from slidestein.identity.slide_identity import compute_input_fingerprint
+
+        rows = self._get_conn().execute(
             """
-            SELECT COUNT(*)
+            SELECT sr.slide_id,
+                   sr.content_fingerprint,
+                   sr.structure_fingerprint,
+                   sc.input_fingerprint,
+                   sc.prompt_version
             FROM slide_records sr
             JOIN slide_classifications sc
               ON sc.slide_id = sr.slide_id
              AND sc.classification_version = ?
             WHERE sr.is_active = 1
+              AND sr.content_fingerprint IS NOT NULL
+              AND sr.structure_fingerprint IS NOT NULL
             """,
             (version,),
-        ).fetchone()
-        return row[0]
+        ).fetchall()
+
+        count = 0
+        for row in rows:
+            slide_id, content_fp, structure_fp, stored_fp, prompt_version = (
+                row[0], row[1], row[2], row[3], row[4],
+            )
+            current_fp = compute_input_fingerprint(
+                slide_id, content_fp, structure_fp, version, prompt_version
+            )
+            if current_fp == stored_fp:
+                count += 1
+        return count
 
     def list_classifications(
         self,

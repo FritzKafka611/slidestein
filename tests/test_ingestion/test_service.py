@@ -7,7 +7,9 @@ requires PowerPoint or LibreOffice and must be opted into explicitly.
 
 from __future__ import annotations
 
+import io
 import uuid
+import zipfile
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -414,3 +416,303 @@ def test_render_preview_end_to_end(three_slide_pptx, settings):
             assert r.preview_path.stat().st_size > 0
     finally:
         library.close()
+
+
+# ---------------------------------------------------------------------------
+# Helpers for PPTX manipulation (used by M3.4.1 regression tests)
+# ---------------------------------------------------------------------------
+
+
+def _create_n_slide_pptx(path: "Path", n: int) -> None:
+    """Save a fresh PPTX with n slides to path."""
+    from pptx import Presentation as _Prs
+    prs = _Prs()
+    layout = prs.slide_layouts[0]
+    for i in range(1, n + 1):
+        slide = prs.slides.add_slide(layout)
+        for ph in slide.placeholders:
+            if ph.placeholder_format.idx == 0:
+                ph.text = f"Slide {i}"
+            elif ph.placeholder_format.idx == 1:
+                ph.text = f"Body {i}"
+    prs.save(str(path))
+
+
+def _remove_last_slide_in_place(pptx_path: "Path") -> None:
+    """Remove the last slide from a PPTX ZIP in-place (lxml-based).
+
+    Deletes the <p:sldId> entry from ppt/presentation.xml, removes its
+    Relationship from ppt/_rels/presentation.xml.rels, and strips the
+    slide XML + its rels sidecar from the archive.
+    """
+    from lxml import etree
+
+    _NS_P  = "http://schemas.openxmlformats.org/presentationml/2006/main"
+    _NS_R  = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    _NS_RL = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+    with zipfile.ZipFile(pptx_path, "r") as z:
+        entries = {name: z.read(name) for name in z.namelist()}
+
+    prs_root  = etree.fromstring(entries["ppt/presentation.xml"])
+    rels_root = etree.fromstring(entries["ppt/_rels/presentation.xml.rels"])
+
+    sld_id_lst = prs_root.find(f"{{{_NS_P}}}sldIdLst")
+    last = sld_id_lst[-1]
+    r_id = last.get(f"{{{_NS_R}}}id")
+
+    slide_target: str | None = None
+    for rel in list(rels_root):
+        if rel.get("Id") == r_id:
+            slide_target = rel.get("Target")  # e.g. "slides/slide3.xml"
+            rels_root.remove(rel)
+            break
+
+    sld_id_lst.remove(last)
+
+    entries["ppt/presentation.xml"] = etree.tostring(
+        prs_root, xml_declaration=True, encoding="UTF-8", standalone=True
+    )
+    entries["ppt/_rels/presentation.xml.rels"] = etree.tostring(
+        rels_root, xml_declaration=True, encoding="UTF-8", standalone=True
+    )
+
+    if slide_target:
+        slide_zip = f"ppt/{slide_target}"
+        # slide_target is "slides/slideN.xml" — rels sidecar is slides/_rels/slideN.xml.rels
+        fname = slide_target.rsplit("/", 1)[-1]
+        rels_zip = f"ppt/slides/_rels/{fname}.rels"
+        entries.pop(slide_zip, None)
+        entries.pop(rels_zip, None)
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, data in entries.items():
+            z.writestr(name, data)
+    pptx_path.write_bytes(buf.getvalue())
+
+
+def _reorder_first_slide_to_last(src_path: "Path", dest_path: "Path") -> None:
+    """Copy src_path to dest_path with the first slide moved to the last position.
+
+    Moves the <p:sldId> element at index 0 to the end of <p:sldIdLst>.
+    The native_slide_id (id= attribute) is unchanged — only the list position
+    (== slide_number) changes.  This is a direct proof that identity != ordinal.
+    """
+    from lxml import etree
+
+    _NS_P = "http://schemas.openxmlformats.org/presentationml/2006/main"
+
+    with zipfile.ZipFile(src_path, "r") as z:
+        entries = {name: z.read(name) for name in z.namelist()}
+
+    prs_root  = etree.fromstring(entries["ppt/presentation.xml"])
+    sld_id_lst = prs_root.find(f"{{{_NS_P}}}sldIdLst")
+
+    if len(sld_id_lst) > 1:
+        first = sld_id_lst[0]
+        sld_id_lst.remove(first)
+        sld_id_lst.append(first)
+
+    entries["ppt/presentation.xml"] = etree.tostring(
+        prs_root, xml_declaration=True, encoding="UTF-8", standalone=True
+    )
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, data in entries.items():
+            z.writestr(name, data)
+    dest_path.write_bytes(buf.getvalue())
+
+
+# ---------------------------------------------------------------------------
+# M3.4.1 Fix 1 regression — deleted-slide / reindex
+# ---------------------------------------------------------------------------
+
+
+class TestDeletedSlideRegression:
+    """Verify that a slide removed between two index runs becomes inactive,
+    while remaining slides keep their stable slide_ids and deck_id."""
+
+    def test_removed_slide_becomes_inactive_on_reindex(self, tmp_path, settings):
+        pptx_path = tmp_path / "deck.pptx"
+        _create_n_slide_pptx(pptx_path, n=3)
+
+        library, svc = _make_service(settings)
+
+        # First ingest — 3 slides.
+        records1 = svc.ingest_deck(pptx_path, render_previews=False)
+        deck_id = records1[0].deck_id
+        id_by_native = {r.native_slide_id: r.slide_id for r in records1}
+        removed_native = records1[2].native_slide_id  # last slide's native ID
+        removed_slide_id = records1[2].slide_id
+
+        # Remove slide 3 from the PPTX at the same path.
+        _remove_last_slide_in_place(pptx_path)
+
+        # Re-ingest — should retire old slides and insert 2 fresh active ones.
+        records2 = svc.ingest_deck(pptx_path, render_previews=False)
+
+        try:
+            # deck_id preserved (same path, different fingerprint → rule B).
+            assert records2[0].deck_id == deck_id, "deck_id must survive edit"
+
+            # Remaining slides keep their stable slide_ids.
+            for r2 in records2:
+                assert r2.slide_id == id_by_native[r2.native_slide_id], (
+                    f"slide_id changed for native_slide_id={r2.native_slide_id}"
+                )
+
+            # Active count is 2.
+            active = library.list_active_slides()
+            assert len(active) == 2, f"expected 2 active, got {len(active)}"
+
+            # Removed slide is still in the DB but marked inactive.
+            removed = library.get_record(removed_slide_id)
+            assert removed is not None, "removed slide must be retained historically"
+            assert not removed.is_active, "removed slide must be inactive"
+        finally:
+            library.close()
+
+    def test_deck_id_unchanged_after_content_edit(self, tmp_path, settings):
+        """Editing file content preserves deck_id (lineage rule B)."""
+        pptx_path = tmp_path / "deck.pptx"
+        _create_n_slide_pptx(pptx_path, n=2)
+
+        library, svc = _make_service(settings)
+        records1 = svc.ingest_deck(pptx_path, render_previews=False)
+        original_deck_id = records1[0].deck_id
+
+        # Overwrite with different content (different fingerprint, same path).
+        _create_n_slide_pptx(pptx_path, n=2)
+        # Save a slightly different version by adding one more character.
+        from pptx import Presentation as _Prs
+        prs = _Prs(str(pptx_path))
+        prs.slides[0].placeholders[0].text = "Modified Title"
+        prs.save(str(pptx_path))
+
+        records2 = svc.ingest_deck(pptx_path, render_previews=False)
+        try:
+            assert records2[0].deck_id == original_deck_id
+        finally:
+            library.close()
+
+
+# ---------------------------------------------------------------------------
+# M3.4.1 Fix 4 regression — slide reorder preserves identity
+# ---------------------------------------------------------------------------
+
+
+class TestReorderRegression:
+    """Prove that slide identity != slide ordinal position.
+
+    After moving slide A from position 1 to the last position within the SAME
+    deck path (rule B: same path, different fingerprint → same deck_id):
+      - native_slide_id unchanged
+      - slide_id unchanged
+      - slide_number changed
+    """
+
+    def test_slide_id_stable_after_reorder(self, tmp_path, settings):
+        pptx_path = tmp_path / "deck.pptx"
+        _create_n_slide_pptx(pptx_path, n=3)
+
+        library, svc = _make_service(settings)
+
+        # Ingest original.
+        records_before = svc.ingest_deck(pptx_path, render_previews=False)
+        first_before = records_before[0]
+
+        # Reorder: move first slide to last, save BACK to the same path.
+        # _reorder_first_slide_to_last reads all entries before writing, so
+        # src == dest is safe.
+        _reorder_first_slide_to_last(pptx_path, pptx_path)
+
+        # Re-ingest the same path (now reordered).
+        records_after = svc.ingest_deck(pptx_path, render_previews=False)
+
+        try:
+            first_native = first_before.native_slide_id
+            moved = next(r for r in records_after if r.native_slide_id == first_native)
+
+            assert moved.slide_id == first_before.slide_id, (
+                "slide_id must be stable across reorder"
+            )
+            assert moved.slide_number != first_before.slide_number, (
+                "slide_number must have changed after reorder"
+            )
+            assert moved.slide_number == len(records_after), (
+                "moved slide must be last after reorder"
+            )
+        finally:
+            library.close()
+
+    def test_all_other_slide_ids_stable_after_reorder(self, tmp_path, settings):
+        """Non-moved slides also keep their slide_ids after a reorder."""
+        pptx_path = tmp_path / "deck.pptx"
+        _create_n_slide_pptx(pptx_path, n=3)
+
+        library, svc = _make_service(settings)
+        records_before = svc.ingest_deck(pptx_path, render_previews=False)
+        id_by_native   = {r.native_slide_id: r.slide_id for r in records_before}
+
+        _reorder_first_slide_to_last(pptx_path, pptx_path)
+        records_after = svc.ingest_deck(pptx_path, render_previews=False)
+
+        try:
+            for r in records_after:
+                assert r.slide_id == id_by_native[r.native_slide_id], (
+                    f"slide_id changed for native_slide_id={r.native_slide_id}"
+                )
+        finally:
+            library.close()
+
+
+# ---------------------------------------------------------------------------
+# M3.4.1 Fix 5 regression — slide insertion preserves existing identities
+# ---------------------------------------------------------------------------
+
+
+class TestInsertionRegression:
+    """Inserting a new slide into the same deck must not alter any pre-existing
+    native_slide_ids or slide_ids."""
+
+    def test_existing_ids_unchanged_after_insertion(self, tmp_path, settings):
+        from pptx import Presentation as _Prs
+
+        pptx_path = tmp_path / "deck.pptx"
+        _create_n_slide_pptx(pptx_path, n=2)
+
+        library, svc = _make_service(settings)
+        records_before = svc.ingest_deck(pptx_path, render_previews=False)
+        id_by_native   = {r.native_slide_id: r.slide_id for r in records_before}
+
+        # Append a new slide and save BACK to the same path (rule B: same path,
+        # new fingerprint → same deck_id).
+        prs = _Prs(str(pptx_path))
+        new_slide = prs.slides.add_slide(prs.slide_layouts[0])
+        new_slide.placeholders[0].text = "Inserted Slide"
+        prs.save(str(pptx_path))
+
+        records_after = svc.ingest_deck(pptx_path, render_previews=False)
+
+        try:
+            assert len(records_after) == 3, "should have 3 slides after insertion"
+
+            # Pre-existing slides keep their stable slide_ids.
+            for r in records_after:
+                if r.native_slide_id in id_by_native:
+                    assert r.slide_id == id_by_native[r.native_slide_id], (
+                        f"slide_id changed for pre-existing native_slide_id={r.native_slide_id}"
+                    )
+
+            # Inserted slide has a distinct native ID and slide_id.
+            original_natives = set(id_by_native.keys())
+            new_records = [r for r in records_after if r.native_slide_id not in original_natives]
+            assert len(new_records) == 1, "exactly one new slide expected"
+            new_r = new_records[0]
+            assert new_r.slide_id not in id_by_native.values(), (
+                "inserted slide must have a new slide_id"
+            )
+        finally:
+            library.close()
