@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     aicore_resource_group: str = "default"
     sap_ai_core_model: str = "claude-3.5-sonnet"
 
+    # Embedding provider: "sap_ai_core"
+    embedding_provider: str = "sap_ai_core"
+    sap_ai_core_embedding_model: str = "text-embedding-3-large"
+
     # PPT Master integration (Milestone 2.5+)
     # pptmaster_python: set to the Python inside tools/pptmaster-env/ or leave
     # None for auto-discovery (looks for tools/pptmaster-env/Scripts/python.exe).

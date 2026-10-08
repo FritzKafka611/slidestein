@@ -899,5 +899,205 @@ def classifications(
     console.print(table)
 
 
+@app.command("embed-all")
+def embed_all(
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Re-embed even slides that already have a current embedding.",
+    ),
+) -> None:
+    """Build or refresh the semantic embedding index for all active slides.
+
+    Skips slides whose embedding input fingerprint is already current.
+    Slides with no current V2 classification are skipped (counted as unclassified).
+    Uses batch embedding where possible.
+    """
+    from slidestein.classification.versions import CLASSIFICATION_VERSION
+    from slidestein.config import get_settings
+    from slidestein.library.store import SlideLibrary
+    from slidestein.retrieval.document import build_retrieval_document
+    from slidestein.retrieval.fingerprint import EmbeddingConfig, compute_embedding_fingerprint
+    from slidestein.retrieval.providers.factory import create_embedding_provider
+    from slidestein.retrieval.store import EmbeddingRecord, SlideVectorStore
+    from slidestein.retrieval.versions import EMBEDDING_VERSION
+
+    settings = get_settings()
+
+    console.print("[bold cyan]SlideStein[/bold cyan]  embed-all")
+
+    with SlideLibrary(settings.db_path, settings.lancedb_uri) as library:
+        active = library.list_active_slides()
+
+    if not active:
+        console.print("  No active slides found.")
+        return
+
+    console.print(f"  Checking {len(active)} active slide(s)...\n")
+
+    provider = create_embedding_provider(settings)
+    vector_store = SlideVectorStore(settings.lancedb_uri)
+
+    embedding_cfg = EmbeddingConfig(
+        version=EMBEDDING_VERSION,
+        provider=settings.embedding_provider,
+        model=settings.sap_ai_core_embedding_model,
+        normalize=True,
+    )
+
+    # Gather slides needing embedding.
+    to_embed: list[tuple] = []   # (record, classification, retrieval_text, fingerprint)
+    n_skipped = 0
+    n_unclassified = 0
+
+    with SlideLibrary(settings.db_path, settings.lancedb_uri) as library:
+        for record in active:
+            cls_rec = library.get_classification(record.slide_id, CLASSIFICATION_VERSION)
+            if cls_rec is None:
+                n_unclassified += 1
+                continue
+
+            retrieval_text = build_retrieval_document(cls_rec.profile)
+            fp = compute_embedding_fingerprint(retrieval_text, embedding_cfg)
+
+            if not force and vector_store.is_current(record.slide_id, fp):
+                n_skipped += 1
+                continue
+
+            to_embed.append((record, cls_rec, retrieval_text, fp))
+
+    n_embedded = 0
+    n_failed = 0
+
+    if to_embed:
+        # Batch embed all stale slides.
+        texts = [item[2] for item in to_embed]
+        try:
+            batch = provider.embed_documents(texts)
+        except Exception as exc:
+            console.print(f"  [red]Embedding error:[/red] {exc}")
+            raise typer.Exit(1) from exc
+
+        # Build records and upsert.
+        emb_records: list[EmbeddingRecord] = []
+        vectors: list[list[float]] = []
+
+        for (record, cls_rec, retrieval_text, fp), vec in zip(to_embed, batch.vectors):
+            profile = cls_rec.profile
+            job_val = profile.primary_communication_job.value if profile.primary_communication_job else ""
+            emb_records.append(
+                EmbeddingRecord(
+                    slide_id=record.slide_id,
+                    deck_id=record.deck_id or "",
+                    slide_number=record.slide_number,
+                    embedding_version=EMBEDDING_VERSION,
+                    embedding_provider=settings.embedding_provider,
+                    embedding_model=batch.model,
+                    embedding_input_fingerprint=fp,
+                    classification_version=CLASSIFICATION_VERSION,
+                    retrieval_text=retrieval_text,
+                    slide_function=profile.slide_function.value,
+                    primary_communication_job=job_val,
+                    visual_archetype=profile.visual_archetype.value,
+                    density=profile.density.value,
+                    description=profile.description,
+                    is_active=True,
+                )
+            )
+            vectors.append(vec)
+
+        try:
+            vector_store.upsert_batch(emb_records, vectors)
+            n_embedded = len(emb_records)
+        except Exception as exc:
+            console.print(f"  [red]Vector store error:[/red] {exc}")
+            raise typer.Exit(1) from exc
+
+    # Deactivate vectors for slides no longer active.
+    active_ids = {r.slide_id for r in active}
+    tbl = vector_store._get_table()
+    if tbl is not None:
+        try:
+            all_active_rows = (
+                tbl.search()
+                .where("is_active = true", prefilter=True)
+                .select(["slide_id"])
+                .limit(None)
+                .to_list()
+            )
+            stale_ids = [
+                row["slide_id"]
+                for row in all_active_rows
+                if row["slide_id"] not in active_ids
+            ]
+            if stale_ids:
+                vector_store.deactivate_slides(stale_ids)
+        except Exception:
+            pass  # Non-critical cleanup
+
+    console.print(f"  Active slides      {len(active):>6}")
+    console.print(f"  Current / skipped  {n_skipped:>6}")
+    console.print(f"  Embedded           {n_embedded:>6}")
+    console.print(f"  Unclassified       {n_unclassified:>6}")
+    console.print(f"  Failed             {n_failed:>6}")
+    console.print("\n  Done.")
+
+    if n_failed > 0:
+        raise typer.Exit(1)
+
+
+@app.command("semantic-search")
+def semantic_search(
+    query: str = typer.Argument(..., help="Natural-language search query."),
+    top_k: int = typer.Option(5, "--top-k", "-k", help="Number of results to return."),
+) -> None:
+    """Search the slide index by semantic similarity.
+
+    Returns the top-k slides ranked by cosine similarity to the query.
+    Pure vector retrieval — no hybrid scoring or reranking.
+    """
+    from slidestein.config import get_settings
+    from slidestein.retrieval.providers.factory import create_embedding_provider
+    from slidestein.retrieval.search import SemanticSlideSearch
+    from slidestein.retrieval.store import SlideVectorStore
+
+    if not query.strip():
+        console.print("[red]Error:[/red] query must not be blank.")
+        raise typer.Exit(1)
+    if top_k <= 0:
+        console.print("[red]Error:[/red] --top-k must be > 0.")
+        raise typer.Exit(1)
+
+    settings = get_settings()
+
+    try:
+        provider = create_embedding_provider(settings)
+        store = SlideVectorStore(settings.lancedb_uri)
+        searcher = SemanticSlideSearch(provider=provider, store=store)
+        results = searcher.search(query, top_k=top_k)
+    except Exception as exc:
+        console.print(f"[red]Search error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    console.print(f"\n[bold cyan]Semantic search[/bold cyan]")
+    console.print(f"Query: [italic]{query}[/italic]\n")
+
+    if not results:
+        console.print("[dim]No results found. Run embed-all first.[/dim]")
+        return
+
+    for r in results:
+        job_display = r.primary_communication_job or "null"
+        console.print(
+            f"[bold]#{r.rank}[/bold]  Slide {r.slide_number} "
+            f"([dim]{r.slide_id[:8]}…[/dim])"
+        )
+        console.print(f"     distance:  {r.distance:.4f}")
+        console.print(f"     function:  {r.slide_function}")
+        console.print(f"     job:       {job_display}")
+        console.print(f"     archetype: {r.visual_archetype}")
+        console.print()
+
+
 if __name__ == "__main__":
     app()
