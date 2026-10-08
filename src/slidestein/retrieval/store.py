@@ -14,6 +14,8 @@ Schema (per row):
     retrieval_text            TEXT
     slide_function            TEXT
     primary_communication_job TEXT  (empty string for null)
+    secondary_communication_jobs TEXT  (comma-joined; empty string for none)
+    storyline_roles           TEXT  (comma-joined)
     visual_archetype          TEXT
     density                   TEXT
     description               TEXT
@@ -52,6 +54,8 @@ class EmbeddingRecord:
     retrieval_text: str
     slide_function: str
     primary_communication_job: str  # "" for null
+    secondary_communication_jobs: str  # comma-joined; "" for empty
+    storyline_roles: str  # comma-joined
     visual_archetype: str
     density: str
     description: str
@@ -189,6 +193,8 @@ class SlideVectorStore:
                 "retrieval_text": r.retrieval_text,
                 "slide_function": r.slide_function,
                 "primary_communication_job": r.primary_communication_job,
+                "secondary_communication_jobs": r.secondary_communication_jobs,
+                "storyline_roles": r.storyline_roles,
                 "visual_archetype": r.visual_archetype,
                 "density": r.density,
                 "description": r.description,
@@ -330,6 +336,136 @@ class SlideVectorStore:
             values={"is_active": False},
         )
 
+    def rebuild_with_enriched_metadata(
+        self, enriched_records: list[EmbeddingRecord], expected_dim: int
+    ) -> int:
+        """Rebuild the LanceDB table, adding new metadata columns while preserving vectors.
+
+        Reads all existing rows (including vectors) from the current table, merges in
+        updated metadata from *enriched_records*, drops the old table, and creates a
+        new table with the full enriched schema.  Vectors are NOT recomputed.
+
+        Parameters
+        ----------
+        enriched_records:
+            Updated EmbeddingRecord objects containing current V2 metadata (including
+            secondary_communication_jobs and storyline_roles).  Must cover all slide_ids
+            that exist in the table; rows not matched by slide_id are written as-is from
+            the existing store data.
+        expected_dim:
+            Expected vector dimension; used to validate consistency after reading.
+
+        Returns
+        -------
+        int
+            Number of rows written to the new table.
+
+        Raises
+        ------
+        RuntimeError
+            If the table does not exist, or if a vector dimension mismatch is detected.
+        """
+        import lancedb
+
+        tbl = self._get_table()
+        if tbl is None:
+            raise RuntimeError(
+                f"Table '{_TABLE_NAME}' does not exist. Run embed-all first."
+            )
+
+        # Read all existing rows including vectors.
+        all_rows: list[dict] = tbl.to_arrow().to_pylist()
+
+        if not all_rows:
+            raise RuntimeError("Table is empty — nothing to migrate.")
+
+        # Validate first row's vector dimension.
+        sample_vec = all_rows[0].get("vector")
+        if sample_vec is None:
+            raise RuntimeError("Existing rows have no 'vector' column.")
+        actual_dim = len(sample_vec)
+        if actual_dim != expected_dim:
+            raise DimensionMismatchError(
+                f"Expected dimension {expected_dim} but found {actual_dim} in store."
+            )
+
+        # Build lookup from slide_id → enriched record for fast merge.
+        enriched_by_id = {r.slide_id: r for r in enriched_records}
+
+        # Build new rows: use enriched metadata where available, else keep existing.
+        new_rows: list[dict] = []
+        for row in all_rows:
+            sid = row["slide_id"]
+            rec = enriched_by_id.get(sid)
+            if rec is not None:
+                new_rows.append(
+                    {
+                        "slide_id": rec.slide_id,
+                        "deck_id": rec.deck_id,
+                        "slide_number": rec.slide_number,
+                        "embedding_version": rec.embedding_version,
+                        "embedding_provider": rec.embedding_provider,
+                        "embedding_model": rec.embedding_model,
+                        "embedding_input_fingerprint": rec.embedding_input_fingerprint,
+                        "classification_version": rec.classification_version,
+                        "retrieval_text": rec.retrieval_text,
+                        "slide_function": rec.slide_function,
+                        "primary_communication_job": rec.primary_communication_job,
+                        "secondary_communication_jobs": rec.secondary_communication_jobs,
+                        "storyline_roles": rec.storyline_roles,
+                        "visual_archetype": rec.visual_archetype,
+                        "density": rec.density,
+                        "description": rec.description,
+                        "is_active": rec.is_active,
+                        "vector": row["vector"],
+                    }
+                )
+            else:
+                # Preserve existing row; fill new columns with empty strings.
+                new_rows.append(
+                    {
+                        "slide_id": row.get("slide_id", ""),
+                        "deck_id": row.get("deck_id", ""),
+                        "slide_number": row.get("slide_number", 0),
+                        "embedding_version": row.get("embedding_version", ""),
+                        "embedding_provider": row.get("embedding_provider", ""),
+                        "embedding_model": row.get("embedding_model", ""),
+                        "embedding_input_fingerprint": row.get("embedding_input_fingerprint", ""),
+                        "classification_version": row.get("classification_version", ""),
+                        "retrieval_text": row.get("retrieval_text", ""),
+                        "slide_function": row.get("slide_function", ""),
+                        "primary_communication_job": row.get("primary_communication_job", ""),
+                        "secondary_communication_jobs": row.get("secondary_communication_jobs", ""),
+                        "storyline_roles": row.get("storyline_roles", ""),
+                        "visual_archetype": row.get("visual_archetype", ""),
+                        "density": row.get("density", ""),
+                        "description": row.get("description", ""),
+                        "is_active": row.get("is_active", True),
+                        "vector": row["vector"],
+                    }
+                )
+
+        # Drop old table and attempt to create the enriched replacement.
+        # If creation fails, restore from the in-memory backup (all_rows).
+        db = self._get_db()
+        db.drop_table(_TABLE_NAME)
+        self._table = None
+        try:
+            self._table = db.create_table(_TABLE_NAME, data=new_rows)
+        except Exception as create_exc:
+            # Attempt in-memory restore to avoid data loss.
+            try:
+                self._table = db.create_table(_TABLE_NAME, data=all_rows)
+            except Exception as restore_exc:
+                raise RuntimeError(
+                    f"Migration failed AND restore also failed: {restore_exc}"
+                ) from create_exc
+            raise RuntimeError(
+                f"Migration failed (original restored from memory): {create_exc}"
+            ) from create_exc
+
+        return len(new_rows)
+
     # ------------------------------------------------------------------
     # Search
     # ------------------------------------------------------------------
@@ -373,13 +509,18 @@ class SlideVectorStore:
                     "slide_number": row.get("slide_number", 0),
                     "slide_function": row.get("slide_function", ""),
                     "primary_communication_job": row.get("primary_communication_job", ""),
+                    "secondary_communication_jobs": row.get("secondary_communication_jobs", ""),
+                    "storyline_roles": row.get("storyline_roles", ""),
                     "visual_archetype": row.get("visual_archetype", ""),
                     "density": row.get("density", ""),
                     "description": row.get("description", ""),
                     "retrieval_text": row.get("retrieval_text", ""),
                     "embedding_version": row.get("embedding_version", ""),
+                    "embedding_provider": row.get("embedding_provider", ""),
                     "embedding_model": row.get("embedding_model", ""),
                     "embedding_input_fingerprint": row.get("embedding_input_fingerprint", ""),
+                    "is_active": row.get("is_active", True),
+                    "vector": row.get("vector", []),
                     "_distance": row["_distance"],
                 }
             )
