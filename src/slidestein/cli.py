@@ -579,9 +579,9 @@ def classify_slide(
     If the slide is indexed in the library, the classification is persisted.
     """
     from slidestein.classification.classifier import (
-        AnthropicSlideClassifier,
         SlideClassificationError,
     )
+    from slidestein.classification.providers.factory import create_slide_classifier
     from slidestein.classification.service import SlideClassificationService
     from slidestein.classification.versions import CLASSIFICATION_VERSION, PROMPT_VERSION
     from slidestein.config import get_settings
@@ -633,8 +633,10 @@ def classify_slide(
     if output is not None:
         console.print("  [dim]classifying...[/dim]")
 
+    from slidestein.classification.providers.factory import create_slide_classifier
+
     service = SlideClassificationService(
-        classifier=AnthropicSlideClassifier(),
+        classifier=create_slide_classifier(settings),
         renderer=PythonPptxAdapter(),
     )
 
@@ -721,9 +723,9 @@ def classify_all(
     classifier from SlideClassificationService.  For testing, inject a mock.
     """
     from slidestein.classification.classifier import (
-        AnthropicSlideClassifier,
         SlideClassificationError,
     )
+    from slidestein.classification.providers.factory import create_slide_classifier
     from slidestein.classification.service import SlideClassificationService
     from slidestein.classification.versions import CLASSIFICATION_VERSION, PROMPT_VERSION
     from slidestein.config import get_settings
@@ -750,7 +752,7 @@ def classify_all(
         )
 
         service = SlideClassificationService(
-            classifier=AnthropicSlideClassifier(),
+            classifier=create_slide_classifier(settings),
             renderer=PythonPptxAdapter(),
         )
 

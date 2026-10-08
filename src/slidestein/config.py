@@ -19,6 +19,17 @@ class Settings(BaseSettings):
     vision_model: str = "claude-opus-4-5"
     classification_model: str = "claude-opus-4-5"
 
+    # Classification provider: "anthropic" or "sap_ai_core"
+    classification_provider: str = "anthropic"
+
+    # SAP AI Core / Generative AI Hub credentials (loaded from .env)
+    aicore_auth_url: Optional[str] = None
+    aicore_client_id: Optional[str] = None
+    aicore_client_secret: Optional[str] = None
+    aicore_base_url: Optional[str] = None
+    aicore_resource_group: str = "default"
+    sap_ai_core_model: str = "claude-3.5-sonnet"
+
     # PPT Master integration (Milestone 2.5+)
     # pptmaster_python: set to the Python inside tools/pptmaster-env/ or leave
     # None for auto-discovery (looks for tools/pptmaster-env/Scripts/python.exe).

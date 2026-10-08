@@ -12,6 +12,7 @@ dependencies = [
     "python-pptx>=1.0.0",
     "lancedb>=0.13.0",
     "comtypes>=1.4.17",
+    "sap-ai-sdk-gen>=7.4.1",
 ]
 
 [project.scripts]
