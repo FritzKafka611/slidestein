@@ -15,7 +15,7 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from slidestein.domain.models import SlideClassificationInput, SlideSemanticProfile
+from slidestein.domain.models import SlideClassificationInput, SlideSemanticProfileV2
 
 if TYPE_CHECKING:
     from ai_core_sdk.ai_core_v2_client import AICoreV2Client
@@ -72,7 +72,7 @@ class SAPAICoreClassifier:
     def classify(
         self,
         classification_input: SlideClassificationInput,
-    ) -> SlideSemanticProfile:
+    ) -> SlideSemanticProfileV2:
         """Classify *classification_input* via SAP AI Core and return a validated profile.
 
         Raises
@@ -108,7 +108,7 @@ class SAPAICoreClassifier:
         json_text = _strip_fences(raw_text)
 
         try:
-            profile = SlideSemanticProfile.model_validate_json(json_text)
+            profile = SlideSemanticProfileV2.model_validate_json(json_text)
         except Exception as exc:
             raise SlideClassificationError(
                 f"SAP AI Core returned invalid JSON for slide "

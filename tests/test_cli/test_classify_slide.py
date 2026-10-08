@@ -18,7 +18,9 @@ from slidestein.cli import app
 from slidestein.domain.models import (
     CommunicationJob,
     DensityLevel,
+    SlideFunction,
     SlideSemanticProfile,
+    SlideSemanticProfileV2,
     StorylineRole,
     VisualArchetype,
 )
@@ -204,3 +206,80 @@ class TestMissingPptxExitsNonZero:
         ])
         assert result.exit_code == 1
         assert "not found" in result.output.lower()
+
+
+# ---------------------------------------------------------------------------
+# Regression: null primary_communication_job must not crash CLI output
+# (M3.6 — V2 allows null job for non-content slide_function values)
+# ---------------------------------------------------------------------------
+
+
+def _fake_v2_nav_profile(slide_id: str = "abc123def456-001") -> SlideSemanticProfileV2:
+    return SlideSemanticProfileV2(
+        slide_id=slide_id,
+        slide_function=SlideFunction.SECTION_DIVIDER,
+        primary_communication_job=None,
+        secondary_communication_jobs=[],
+        storyline_roles=[StorylineRole.CONTEXT],
+        visual_archetype=VisualArchetype.TITLE,
+        structural_pattern="Single centred title with decorative element.",
+        density=DensityLevel.LOW,
+        description="Section divider slide.",
+    )
+
+
+class TestNullCommunicationJobRendering:
+    """Regression for AttributeError: 'NoneType' has no attribute 'value'.
+
+    classify-slide crashed when displaying a V2 non-content profile because
+    primary_communication_job is legitimately None for section_divider /
+    cover / closing slides.
+    """
+
+    def test_null_job_with_output_flag_exits_zero(
+        self, three_slide_pptx: Path, tmp_path: Path
+    ) -> None:
+        """--output path must not crash for null primary_communication_job."""
+        profile = _fake_v2_nav_profile()
+        out = tmp_path / "nav_profile.json"
+        result, _ = _invoke(
+            ["classify-slide", str(three_slide_pptx), "1", "--output", str(out)],
+            profile=profile,
+        )
+        assert result.exit_code == 0, f"unexpected crash: {result.output}"
+
+    def test_null_job_renders_safely_in_output(
+        self, three_slide_pptx: Path, tmp_path: Path
+    ) -> None:
+        """Communication job line must display 'null' rather than crashing."""
+        profile = _fake_v2_nav_profile()
+        out = tmp_path / "nav_profile.json"
+        result, _ = _invoke(
+            ["classify-slide", str(three_slide_pptx), "1", "--output", str(out)],
+            profile=profile,
+        )
+        assert "null" in result.output.lower()
+
+    def test_null_job_stdout_path_exits_zero(self, three_slide_pptx: Path) -> None:
+        """Stdout path (no --output) must also handle null job without crash."""
+        profile = _fake_v2_nav_profile()
+        result, _ = _invoke(
+            ["classify-slide", str(three_slide_pptx), "1"],
+            profile=profile,
+        )
+        assert result.exit_code == 0
+
+    def test_null_job_output_file_written(
+        self, three_slide_pptx: Path, tmp_path: Path
+    ) -> None:
+        """Output file is written and validates as SlideSemanticProfileV2."""
+        profile = _fake_v2_nav_profile()
+        out = tmp_path / "nav_profile.json"
+        _invoke(
+            ["classify-slide", str(three_slide_pptx), "1", "--output", str(out)],
+            profile=profile,
+        )
+        assert out.exists()
+        loaded = SlideSemanticProfileV2.model_validate_json(out.read_text(encoding="utf-8"))
+        assert loaded.primary_communication_job is None
+        assert loaded.slide_function == SlideFunction.SECTION_DIVIDER

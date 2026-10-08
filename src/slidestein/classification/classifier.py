@@ -20,7 +20,7 @@ import re
 from typing import Protocol
 
 from slidestein.config import get_settings
-from slidestein.domain.models import SlideClassificationInput, SlideSemanticProfile
+from slidestein.domain.models import SlideClassificationInput, SlideSemanticProfileV2
 
 _SYSTEM_PROMPT = (
     "You are a slide classification assistant. "
@@ -57,8 +57,8 @@ class SlideClassifier(Protocol):
     def classify(
         self,
         classification_input: SlideClassificationInput,
-    ) -> SlideSemanticProfile:
-        """Classify a slide and return its semantic profile.
+    ) -> SlideSemanticProfileV2:
+        """Classify a slide and return its V2 semantic profile.
 
         Raises SlideClassificationError on any failure.
         """
@@ -105,8 +105,8 @@ class AnthropicSlideClassifier:
     def classify(
         self,
         classification_input: SlideClassificationInput,
-    ) -> SlideSemanticProfile:
-        """Classify *classification_input* and return a validated profile.
+    ) -> SlideSemanticProfileV2:
+        """Classify *classification_input* and return a validated V2 profile.
 
         Raises
         ------
@@ -115,7 +115,7 @@ class AnthropicSlideClassifier:
             - missing / unreadable / unsupported-type preview image
             - Anthropic API errors
             - no text content in the response
-            - JSON that does not validate as SlideSemanticProfile
+            - JSON that does not validate as SlideSemanticProfileV2
             - ``slide_id`` in the returned profile does not match the input
         """
         from .prompt import build_messages
@@ -151,9 +151,9 @@ class AnthropicSlideClassifier:
         raw_text = text_blocks[0].text.strip()
         json_text = _strip_markdown_fences(raw_text)
 
-        # Parse and validate as SlideSemanticProfile.
+        # Parse and validate as SlideSemanticProfileV2.
         try:
-            profile = SlideSemanticProfile.model_validate_json(json_text)
+            profile = SlideSemanticProfileV2.model_validate_json(json_text)
         except Exception as exc:
             raise SlideClassificationError(
                 f"Anthropic API error classifying slide "

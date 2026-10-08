@@ -533,7 +533,7 @@ class TestStaleClassificationCounting:
         ))
         self._store_current_classification(lib, "s1", "cfp-orig", "sfp-orig")
         # Query for a different version — should find nothing.
-        assert lib.count_current_classifications("2.0") == 0
+        assert lib.count_current_classifications("1.0") == 0
         lib.close()
 
     def test_stale_prompt_version_not_counted(self, tmp_path):

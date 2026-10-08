@@ -6,9 +6,10 @@ Every stage of the pipeline passes a typed model defined here.
 
 from __future__ import annotations
 
+import json as _json
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, Union
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -86,6 +87,8 @@ class VisualArchetype(str, Enum):
     MIXED_EXHIBIT = "mixed_exhibit"
     # Pre-existing additional value — useful but not in M3 canonical spec
     BUBBLE_CHART = "bubble_chart"
+    # M3.6 — structured one-pager profile
+    STRUCTURED_ONE_PAGER = "structured_one_pager"
     # Legacy values — preserved for backwards compatibility
     TWO_BY_TWO = "2x2_matrix"
     PROCESS_FLOW = "process_flow"
@@ -98,6 +101,25 @@ class DensityLevel(str, Enum):
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"
+
+
+class SlideFunction(str, Enum):
+    """Physical role of a slide in a deck — independent of its storyline role.
+
+    content         — A slide that delivers substantive consulting content.
+                      Requires a non-null primary_communication_job.
+    cover           — Opening / title slide for a deck or major section.
+                      No communication job (navigational).
+    section_divider — Structural divider marking the start of a new section.
+                      No communication job (navigational).
+    closing         — Final slide of a deck (thank-you, next steps header, etc.).
+                      No communication job (navigational).
+    """
+
+    CONTENT = "content"
+    COVER = "cover"
+    SECTION_DIVIDER = "section_divider"
+    CLOSING = "closing"
 
 
 class ContentSlotType(str, Enum):
@@ -372,6 +394,136 @@ class SlideSemanticProfile(BaseModel):
         return self
 
 
+# ---------------------------------------------------------------------------
+# M3.6 — V2 Semantic Profile with slide_function and calibrated taxonomy
+# ---------------------------------------------------------------------------
+
+# Alias for clarity when both versions are in scope
+SlideSemanticProfileV1 = SlideSemanticProfile
+
+
+class SlideSemanticProfileV2(BaseModel):
+    """Semantic classification output — schema version 2.0.
+
+    Key changes from V1
+    -------------------
+    * Adds ``slide_function`` (content | cover | section_divider | closing).
+    * ``primary_communication_job`` is null for non-content slides.
+    * Cross-field validation enforces the function↔job contract.
+    * ``schema_version`` defaults to "2.0".
+    """
+
+    schema_version: Literal["2.0"] = "2.0"
+    slide_id: str
+    slide_function: SlideFunction
+    primary_communication_job: Optional[CommunicationJob] = None
+    secondary_communication_jobs: list[CommunicationJob] = Field(default_factory=list)
+    storyline_roles: list[StorylineRole] = Field(min_length=1)
+    visual_archetype: VisualArchetype
+    structural_pattern: str
+    density: DensityLevel
+    description: str
+    best_for: list[str] = Field(default_factory=list)
+    not_for: list[str] = Field(default_factory=list)
+
+    @field_validator("slide_id")
+    @classmethod
+    def slide_id_not_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("slide_id must not be blank")
+        return v
+
+    @field_validator("description", "structural_pattern")
+    @classmethod
+    def non_whitespace_text(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("must contain non-whitespace characters")
+        return v
+
+    @field_validator("best_for", "not_for", mode="before")
+    @classmethod
+    def dedup_list(cls, v: list) -> list:
+        seen: set = set()
+        result = []
+        for item in v:
+            if item not in seen:
+                seen.add(item)
+                result.append(item)
+        return result
+
+    @model_validator(mode="after")
+    def validate_function_and_jobs(self) -> "SlideSemanticProfileV2":
+        """Enforce the slide_function ↔ communication_job contract.
+
+        content slides   → primary_communication_job must be non-null;
+                           secondary_jobs deduplication checked.
+        navigational     → primary_communication_job must be null;
+                           secondary_communication_jobs must be empty.
+        """
+        if self.slide_function == SlideFunction.CONTENT:
+            if self.primary_communication_job is None:
+                raise ValueError(
+                    "primary_communication_job must be set (non-null) "
+                    "when slide_function is 'content'"
+                )
+            seen = {self.primary_communication_job}
+            for job in self.secondary_communication_jobs:
+                if job in seen:
+                    raise ValueError(
+                        f"secondary_communication_jobs must not duplicate the "
+                        f"primary job or each other; found {job!r}"
+                    )
+                seen.add(job)
+        else:
+            if self.primary_communication_job is not None:
+                raise ValueError(
+                    f"primary_communication_job must be null for "
+                    f"slide_function={self.slide_function.value!r}; "
+                    "navigational slides do not perform content communication jobs"
+                )
+            if self.secondary_communication_jobs:
+                raise ValueError(
+                    f"secondary_communication_jobs must be empty for "
+                    f"slide_function={self.slide_function.value!r}"
+                )
+        return self
+
+
+def parse_semantic_profile_json(
+    json_str: str,
+) -> Union[SlideSemanticProfileV1, SlideSemanticProfileV2]:
+    """Parse a stored profile JSON string dispatching on ``schema_version``.
+
+    Parameters
+    ----------
+    json_str:
+        Raw JSON string as stored in the ``profile_json`` column.
+
+    Returns
+    -------
+    SlideSemanticProfileV1 | SlideSemanticProfileV2
+
+    Raises
+    ------
+    ValueError
+        If the JSON is malformed or ``schema_version`` is not recognised.
+    """
+    try:
+        raw = _json.loads(json_str)
+    except _json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid profile JSON: {exc}") from exc
+
+    version = raw.get("schema_version", "1.0")
+    if version == "1.0":
+        return SlideSemanticProfile.model_validate(raw)
+    if version == "2.0":
+        return SlideSemanticProfileV2.model_validate(raw)
+    raise ValueError(
+        f"Unknown schema_version {version!r} in stored profile. "
+        "Supported: '1.0', '2.0'."
+    )
+
+
 class SlideClassificationInput(BaseModel):
     """Input to the slide classifier (M3.2).
 
@@ -387,7 +539,13 @@ class SlideClassificationInput(BaseModel):
 
 
 class ClassificationRecord(BaseModel):
-    """A persisted classification result from the slide_classifications table."""
+    """A persisted classification result from the slide_classifications table.
+
+    The ``profile`` field accepts both V1 (SlideSemanticProfile) and V2
+    (SlideSemanticProfileV2) instances.  When the field is given a raw JSON
+    string (e.g. directly from the DB column), ``parse_semantic_profile_json``
+    is called to dispatch to the correct version automatically.
+    """
 
     id: Optional[int] = None
     slide_id: str
@@ -395,5 +553,13 @@ class ClassificationRecord(BaseModel):
     model: str
     prompt_version: str
     input_fingerprint: str
-    profile: SlideSemanticProfile
+    profile: Any  # SlideSemanticProfileV1 or SlideSemanticProfileV2
     classified_at: str = ""
+
+    @field_validator("profile", mode="before")
+    @classmethod
+    def _parse_profile_json(cls, v: Any) -> Any:
+        """Accept a raw JSON string and dispatch to the correct version model."""
+        if isinstance(v, str):
+            return parse_semantic_profile_json(v)
+        return v

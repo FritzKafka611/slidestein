@@ -19,7 +19,9 @@ from slidestein.domain.models import (
     CommunicationJob,
     DensityLevel,
     SlideClassificationInput,
+    SlideFunction,
     SlideSemanticProfile,
+    SlideSemanticProfileV2,
     StorylineRole,
     VisualArchetype,
 )
@@ -30,9 +32,10 @@ from slidestein.domain.models import (
 # ---------------------------------------------------------------------------
 
 
-def _valid_profile(slide_id: str = "test-001") -> SlideSemanticProfile:
-    return SlideSemanticProfile(
+def _valid_profile(slide_id: str = "test-001") -> SlideSemanticProfileV2:
+    return SlideSemanticProfileV2(
         slide_id=slide_id,
+        slide_function=SlideFunction.CONTENT,
         primary_communication_job=CommunicationJob.EXPLAIN,
         storyline_roles=[StorylineRole.CONTEXT],
         visual_archetype=VisualArchetype.BAR_CHART,
@@ -42,7 +45,7 @@ def _valid_profile(slide_id: str = "test-001") -> SlideSemanticProfile:
     )
 
 
-def _mock_create_response(profile: SlideSemanticProfile) -> MagicMock:
+def _mock_create_response(profile: SlideSemanticProfileV2) -> MagicMock:
     response = MagicMock()
     block = MagicMock()
     block.type = "text"
@@ -118,7 +121,7 @@ class TestAnthropicSlideClassifier:
 
         result = _make_classifier(mock_client).classify(_make_input("test-001"))
 
-        assert isinstance(result, SlideSemanticProfile)
+        assert isinstance(result, SlideSemanticProfileV2)
         assert result.slide_id == "test-001"
 
     # 13. Classifier sends a system message requesting raw JSON
@@ -234,7 +237,7 @@ class TestAnthropicSlideClassifier:
 
         result = _make_classifier(mock_client).classify(_make_input("test-001"))
 
-        assert isinstance(result, SlideSemanticProfile)
+        assert isinstance(result, SlideSemanticProfileV2)
         assert result.slide_id == "test-001"
 
 
