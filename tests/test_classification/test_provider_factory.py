@@ -16,7 +16,8 @@ from slidestein.classification.classifier import SlideClassificationError
 from slidestein.classification.providers.factory import create_slide_classifier
 from slidestein.domain.models import (
     SlideClassificationInput,
-    SlideSemanticProfile,
+    SlideFunction,
+    SlideSemanticProfileV2,
     CommunicationJob,
     VisualArchetype,
     DensityLevel,
@@ -43,17 +44,17 @@ def _settings(provider: str = "anthropic", **extra):
     return s
 
 
-def _minimal_profile(slide_id: str) -> SlideSemanticProfile:
-    return SlideSemanticProfile(
+def _minimal_profile(slide_id: str) -> SlideSemanticProfileV2:
+    return SlideSemanticProfileV2(
         slide_id=slide_id,
-        schema_version="1.0",
+        slide_function=SlideFunction.CONTENT,
         primary_communication_job=CommunicationJob.EXPLAIN,
         secondary_communication_jobs=[],
         storyline_roles=[StorylineRole.CONTEXT],
-        visual_archetype=VisualArchetype.TEXT_HEAVY,
-        structural_pattern="Single-column bullet list below a headline.",
+        visual_archetype=VisualArchetype.STRUCTURED_ONE_PAGER,
+        structural_pattern="Five-section one-pager with labeled rows.",
         density=DensityLevel.MEDIUM,
-        description="A context-setting slide with bullet-list evidence.",
+        description="A context-setting workstream charter.",
         best_for=["introducing a new workstream"],
         not_for=["executive summary"],
     )
@@ -117,7 +118,7 @@ class TestSAPAICoreClassifier:
         ai_core_client = MagicMock()
         return SAPAICoreClassifier(ai_core_client=ai_core_client, model="claude-3.5-sonnet")
 
-    def _make_mock_response(self, profile: SlideSemanticProfile) -> str:
+    def _make_mock_response(self, profile: SlideSemanticProfileV2) -> str:
         return profile.model_dump_json()
 
     def test_valid_response_returns_profile(self, tmp_path):
@@ -131,6 +132,7 @@ class TestSAPAICoreClassifier:
 
         assert result.slide_id == slide_id
         assert result.primary_communication_job == CommunicationJob.EXPLAIN
+        assert isinstance(result, SlideSemanticProfileV2)
 
     def test_fenced_json_is_accepted(self, tmp_path):
         slide_id = "slide-fenced"
@@ -181,6 +183,36 @@ class TestSAPAICoreClassifier:
         clf = SAPAICoreClassifier(ai_core_client=MagicMock(), model="claude-3.5-sonnet")
         assert clf._model == "claude-3.5-sonnet"
 
+    def test_non_content_profile_null_job(self):
+        """Non-content profiles (section_divider) with null job are accepted."""
+        slide_id = "slide-nav-001"
+        nav_profile = SlideSemanticProfileV2(
+            slide_id=slide_id,
+            slide_function=SlideFunction.SECTION_DIVIDER,
+            primary_communication_job=None,
+            secondary_communication_jobs=[],
+            storyline_roles=[StorylineRole.CONTEXT],
+            visual_archetype=VisualArchetype.TITLE,
+            structural_pattern="Section divider with title.",
+            density=DensityLevel.LOW,
+            description="Section divider.",
+            best_for=["structuring decks"],
+            not_for=["detailed content"],
+        )
+        clf = self._make_classifier()
+        with patch.object(clf, "_run_orchestration", return_value=nav_profile.model_dump_json()):
+            result = clf.classify(_minimal_input(slide_id))
+        assert result.primary_communication_job is None
+        assert result.slide_function == SlideFunction.SECTION_DIVIDER
+
+    def test_structured_one_pager_archetype_accepted(self):
+        slide_id = "slide-sop-001"
+        profile = _minimal_profile(slide_id)  # already uses STRUCTURED_ONE_PAGER
+        clf = self._make_classifier()
+        with patch.object(clf, "_run_orchestration", return_value=profile.model_dump_json()):
+            result = clf.classify(_minimal_input(slide_id))
+        assert result.visual_archetype == VisualArchetype.STRUCTURED_ONE_PAGER
+
 
 # ---------------------------------------------------------------------------
 # Service-layer independence test
@@ -223,4 +255,5 @@ class TestServiceProviderIndependence:
         )
 
         assert result.slide_id == slide_id
+        assert isinstance(result, SlideSemanticProfileV2)
         mock_classifier.classify.assert_called_once()

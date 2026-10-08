@@ -690,9 +690,10 @@ def classify_slide(
     else:
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json_str, encoding="utf-8")
+        job_val = profile.primary_communication_job.value if profile.primary_communication_job else "null"
         console.print(
             f"\n  [green]ok[/green]  communication job: "
-            f"[cyan]{profile.primary_communication_job.value}[/cyan]"
+            f"[cyan]{job_val}[/cyan]"
         )
         console.print(
             f"  [green]ok[/green]  visual archetype: "

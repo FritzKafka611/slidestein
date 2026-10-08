@@ -17,6 +17,7 @@ from slidestein.domain.models import (
     SlideMetadata,
     SlideRecord,
     SlideSemanticProfile,
+    parse_semantic_profile_json,
 )
 
 _SCHEMA = """
@@ -447,7 +448,7 @@ class SlideLibrary:
             model=row[3],
             prompt_version=row[4],
             input_fingerprint=row[5],
-            profile=SlideSemanticProfile.model_validate_json(row[6]),
+            profile=parse_semantic_profile_json(row[6]),
             classified_at=row[7] or "",
         )
 
@@ -540,7 +541,7 @@ class SlideLibrary:
                     model=row[3],
                     prompt_version=row[4],
                     input_fingerprint=row[5],
-                    profile=SlideSemanticProfile.model_validate_json(row[6]),
+                    profile=parse_semantic_profile_json(row[6]),
                     classified_at=row[7] or "",
                 )
             )

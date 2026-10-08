@@ -16,7 +16,7 @@ from tempfile import TemporaryDirectory
 
 from slidestein.classification.classifier import SlideClassifier
 from slidestein.classification.input_builder import build_slide_classification_input
-from slidestein.domain.models import SlideSemanticProfile
+from slidestein.domain.models import SlideSemanticProfileV2
 from slidestein.pptx.adapter import PPTMasterAdapter
 
 
@@ -48,7 +48,7 @@ class SlideClassificationService:
         slide_number: int,
         slide_id: str | None = None,
         existing_preview_path: Path | None = None,
-    ) -> SlideSemanticProfile:
+    ) -> SlideSemanticProfileV2:
         """Classify slide_number in pptx_path and return its semantic profile.
 
         The source PPTX is opened read-only and never written to.  A temporary
