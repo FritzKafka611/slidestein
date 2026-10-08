@@ -985,6 +985,8 @@ def embed_all(
         for (record, cls_rec, retrieval_text, fp), vec in zip(to_embed, batch.vectors):
             profile = cls_rec.profile
             job_val = profile.primary_communication_job.value if profile.primary_communication_job else ""
+            secondary_jobs_val = ",".join(j.value for j in profile.secondary_communication_jobs)
+            roles_val = ",".join(r.value for r in profile.storyline_roles)
             emb_records.append(
                 EmbeddingRecord(
                     slide_id=record.slide_id,
@@ -998,6 +1000,8 @@ def embed_all(
                     retrieval_text=retrieval_text,
                     slide_function=profile.slide_function.value,
                     primary_communication_job=job_val,
+                    secondary_communication_jobs=secondary_jobs_val,
+                    storyline_roles=roles_val,
                     visual_archetype=profile.visual_archetype.value,
                     density=profile.density.value,
                     description=profile.description,
@@ -1096,6 +1100,256 @@ def semantic_search(
         console.print(f"     function:  {r.slide_function}")
         console.print(f"     job:       {job_display}")
         console.print(f"     archetype: {r.visual_archetype}")
+        console.print()
+
+
+@app.command("metadata-sync")
+def metadata_sync() -> None:
+    """Rebuild the LanceDB table with enriched metadata columns.
+
+    Reads current V2 classifications from the library, builds updated EmbeddingRecord
+    objects (with secondary_communication_jobs and storyline_roles), then rebuilds the
+    LanceDB table in-place — existing vectors are preserved, no SAP calls are made.
+
+    Safe to run multiple times.  The old table is replaced atomically.
+    """
+    from slidestein.classification.versions import CLASSIFICATION_VERSION
+    from slidestein.config import get_settings
+    from slidestein.library.store import SlideLibrary
+    from slidestein.retrieval.fingerprint import EmbeddingConfig, compute_embedding_fingerprint
+    from slidestein.retrieval.store import EmbeddingRecord, SlideVectorStore
+    from slidestein.retrieval.versions import EMBEDDING_VERSION
+
+    settings = get_settings()
+    console.print("[bold cyan]SlideStein[/bold cyan]  metadata-sync")
+
+    vector_store = SlideVectorStore(settings.lancedb_uri)
+
+    if not vector_store.table_exists():
+        console.print("  [red]Error:[/red] No vector table found. Run embed-all first.")
+        raise typer.Exit(1)
+
+    dim = vector_store.dimension()
+    if dim is None:
+        console.print("  [red]Error:[/red] Could not determine table dimension.")
+        raise typer.Exit(1)
+
+    console.print(f"  Table exists — dimension: {dim}")
+
+    # Build enriched records from current V2 classifications.
+    enriched: list[EmbeddingRecord] = []
+
+    embedding_cfg = EmbeddingConfig(
+        version=EMBEDDING_VERSION,
+        provider=settings.embedding_provider,
+        model=settings.sap_ai_core_embedding_model,
+        normalize=True,
+    )
+
+    with SlideLibrary(settings.db_path, settings.lancedb_uri) as library:
+        active = library.list_active_slides()
+        from slidestein.retrieval.document import build_retrieval_document
+
+        for record in active:
+            cls_rec = library.get_classification(record.slide_id, CLASSIFICATION_VERSION)
+            if cls_rec is None:
+                continue
+            profile = cls_rec.profile
+            retrieval_text = build_retrieval_document(profile)
+            fp = compute_embedding_fingerprint(retrieval_text, embedding_cfg)
+            job_val = profile.primary_communication_job.value if profile.primary_communication_job else ""
+            secondary_jobs_val = ",".join(j.value for j in profile.secondary_communication_jobs)
+            roles_val = ",".join(r.value for r in profile.storyline_roles)
+            enriched.append(
+                EmbeddingRecord(
+                    slide_id=record.slide_id,
+                    deck_id=record.deck_id or "",
+                    slide_number=record.slide_number,
+                    embedding_version=EMBEDDING_VERSION,
+                    embedding_provider=settings.embedding_provider,
+                    embedding_model=settings.sap_ai_core_embedding_model,
+                    embedding_input_fingerprint=fp,
+                    classification_version=CLASSIFICATION_VERSION,
+                    retrieval_text=retrieval_text,
+                    slide_function=profile.slide_function.value,
+                    primary_communication_job=job_val,
+                    secondary_communication_jobs=secondary_jobs_val,
+                    storyline_roles=roles_val,
+                    visual_archetype=profile.visual_archetype.value,
+                    density=profile.density.value,
+                    description=profile.description,
+                    is_active=True,
+                )
+            )
+
+    if not enriched:
+        console.print(
+            "  [yellow]Warning:[/yellow] No classified slides found. "
+            "Run classify-all before metadata-sync."
+        )
+        raise typer.Exit(1)
+
+    console.print(f"  Enriched records built: {len(enriched)}")
+    console.print("  Rebuilding table (preserving vectors)...")
+
+    try:
+        n_written = vector_store.rebuild_with_enriched_metadata(enriched, expected_dim=dim)
+    except Exception as exc:
+        console.print(f"  [red]Error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    console.print(f"  [green]ok[/green]  Table rebuilt — {n_written} row(s) written.")
+    console.print("\n  Done.")
+
+
+@app.command("hybrid-search")
+def hybrid_search(
+    query: str = typer.Argument(..., help="Natural-language description of the desired slide."),
+    top_k: int = typer.Option(5, "--top-k", "-k", help="Number of results to return."),
+    function: Optional[str] = typer.Option(
+        None, "--function", "-f", help="Slide function filter (cover, content, section_divider, closing)."
+    ),
+    job: Optional[str] = typer.Option(
+        None, "--job", "-j", help="Primary communication job (explain, summarise, show_timeline, …)."
+    ),
+    archetype: Optional[list[str]] = typer.Option(
+        None, "--archetype", "-a", help="Preferred visual archetypes (repeatable)."
+    ),
+    role: Optional[list[str]] = typer.Option(
+        None, "--role", "-r", help="Required storyline roles (repeatable)."
+    ),
+    density: Optional[str] = typer.Option(
+        None, "--density", "-d", help="Density filter (low, medium, high)."
+    ),
+    required: Optional[list[str]] = typer.Option(
+        None, "--required", help="Required content element (repeatable, appended to query)."
+    ),
+    strict_function: bool = typer.Option(
+        False, "--strict-function", help="Exclude slides that do not match --function exactly."
+    ),
+) -> None:
+    """Search slides with hybrid semantic + metadata scoring.
+
+    Combines vector similarity with structured filters (slide_function, communication
+    job, archetypes, storyline roles, density).  Unspecified dimensions are excluded
+    from scoring — specifying only --query gives pure semantic ranking.
+    """
+    from slidestein.config import get_settings
+    from slidestein.domain.models import (
+        CommunicationJob,
+        DensityLevel,
+        SlideFunction,
+        StorylineRole,
+        VisualArchetype,
+    )
+    from slidestein.retrieval.hybrid import HybridSlideSearch
+    from slidestein.retrieval.providers.factory import create_embedding_provider
+    from slidestein.retrieval.request import SlideRetrievalRequest
+    from slidestein.retrieval.store import SlideVectorStore
+
+    if not query.strip():
+        console.print("[red]Error:[/red] query must not be blank.")
+        raise typer.Exit(1)
+
+    # Parse optional enum values.
+    fn_enum: Optional[SlideFunction] = None
+    if function is not None:
+        try:
+            fn_enum = SlideFunction(function)
+        except ValueError:
+            console.print(f"[red]Error:[/red] Unknown slide function: {function!r}")
+            raise typer.Exit(1)
+
+    job_enum: Optional[CommunicationJob] = None
+    if job is not None:
+        try:
+            job_enum = CommunicationJob(job)
+        except ValueError:
+            console.print(f"[red]Error:[/red] Unknown communication job: {job!r}")
+            raise typer.Exit(1)
+
+    archetype_enums: Optional[list[VisualArchetype]] = None
+    if archetype:
+        try:
+            archetype_enums = [VisualArchetype(a) for a in archetype]
+        except ValueError as exc:
+            console.print(f"[red]Error:[/red] Unknown archetype: {exc}")
+            raise typer.Exit(1)
+
+    role_enums: Optional[list[StorylineRole]] = None
+    if role:
+        try:
+            role_enums = [StorylineRole(r) for r in role]
+        except ValueError as exc:
+            console.print(f"[red]Error:[/red] Unknown storyline role: {exc}")
+            raise typer.Exit(1)
+
+    density_enum: Optional[DensityLevel] = None
+    if density is not None:
+        try:
+            density_enum = DensityLevel(density)
+        except ValueError:
+            console.print(f"[red]Error:[/red] Unknown density: {density!r}")
+            raise typer.Exit(1)
+
+    try:
+        request = SlideRetrievalRequest(
+            query_text=query,
+            slide_function=fn_enum,
+            job=job_enum,
+            archetypes=archetype_enums,
+            roles=role_enums,
+            density=density_enum,
+            required_content_elements=required or [],
+            top_k=top_k,
+            strict_slide_function=strict_function,
+        )
+    except Exception as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(1)
+
+    settings = get_settings()
+
+    try:
+        provider = create_embedding_provider(settings)
+        store = SlideVectorStore(settings.lancedb_uri)
+        searcher = HybridSlideSearch(provider=provider, store=store)
+        results = searcher.search(request)
+    except Exception as exc:
+        console.print(f"[red]Search error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    console.print(f"\n[bold cyan]Hybrid search[/bold cyan]")
+    console.print(f"Query: [italic]{query}[/italic]\n")
+
+    if not results:
+        console.print("[dim]No results found. Run metadata-sync first.[/dim]")
+        return
+
+    for r in results:
+        job_display = r.primary_communication_job or "null"
+        score_parts = [f"hybrid={r.hybrid_score:.4f}", f"semantic={r.semantic_score:.4f}"]
+        if r.slide_function_fit is not None:
+            score_parts.append(f"fn={r.slide_function_fit:.2f}")
+        if r.communication_job_fit is not None:
+            score_parts.append(f"job={r.communication_job_fit:.2f}")
+        if r.visual_archetype_fit is not None:
+            score_parts.append(f"arch={r.visual_archetype_fit:.2f}")
+        if r.storyline_role_fit is not None:
+            score_parts.append(f"role={r.storyline_role_fit:.2f}")
+        if r.density_fit is not None:
+            score_parts.append(f"dens={r.density_fit:.2f}")
+
+        console.print(
+            f"[bold]#{r.rank}[/bold]  Slide {r.slide_number} "
+            f"([dim]{r.slide_id[:8]}…[/dim])"
+        )
+        console.print(f"     scores:    {' | '.join(score_parts)}")
+        console.print(f"     distance:  {r.semantic_distance:.4f}")
+        console.print(f"     function:  {r.slide_function}")
+        console.print(f"     job:       {job_display}")
+        console.print(f"     archetype: {r.visual_archetype}")
+        console.print(f"     roles:     {r.storyline_roles or 'none'}")
         console.print()
 
 

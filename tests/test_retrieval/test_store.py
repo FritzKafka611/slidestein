@@ -44,6 +44,8 @@ def _record(
         retrieval_text="Slide function: content",
         slide_function="content",
         primary_communication_job=job,
+        secondary_communication_jobs="",
+        storyline_roles="context",
         visual_archetype="structured_one_pager",
         density="high",
         description="A test slide.",
