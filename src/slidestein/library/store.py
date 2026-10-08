@@ -315,7 +315,49 @@ class SlideLibrary:
         return self.count_current_classifications(CLASSIFICATION_VERSION)
 
     def count_records_with_embeddings(self) -> int:
-        return 0
+        """Count active slides whose current V2 profile is embedded and up-to-date.
+
+        A slide is counted only when:
+        - it is active in slide_records
+        - it has a current V2 classification
+        - the vector store has an *active* row for it
+        - the stored embedding_input_fingerprint matches the fingerprint
+          recomputed from the current profile + embedding config
+
+        Inactive vectors, stale profiles, wrong model/provider/version are
+        all excluded.  No network calls are made.
+        """
+        from slidestein.classification.versions import CLASSIFICATION_VERSION
+        from slidestein.config import get_settings
+        from slidestein.retrieval.document import build_retrieval_document
+        from slidestein.retrieval.fingerprint import EmbeddingConfig, compute_embedding_fingerprint
+        from slidestein.retrieval.store import SlideVectorStore
+        from slidestein.retrieval.versions import EMBEDDING_VERSION
+
+        try:
+            settings = get_settings()
+            cfg = EmbeddingConfig(
+                version=EMBEDDING_VERSION,
+                provider=settings.embedding_provider,
+                model=settings.sap_ai_core_embedding_model,
+                normalize=True,
+            )
+            slides = self.list_active_slides()
+            expected: dict[str, str] = {}
+            for slide in slides:
+                cls = self.get_classification(slide.slide_id, CLASSIFICATION_VERSION)
+                if cls is None:
+                    continue
+                try:
+                    doc = build_retrieval_document(cls.profile)
+                    fp = compute_embedding_fingerprint(doc, cfg)
+                    expected[slide.slide_id] = fp
+                except Exception:
+                    pass
+            vs = SlideVectorStore(self._lancedb_uri)
+            return vs.count_current_active(expected)
+        except Exception:
+            return 0
 
     # ------------------------------------------------------------------
     # Deck lineage
