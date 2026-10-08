@@ -1353,5 +1353,207 @@ def hybrid_search(
         console.print()
 
 
+@app.command("vision-rerank")
+def vision_rerank(
+    query: str = typer.Argument(..., help="Natural-language description of the desired slide."),
+    candidate_k: int = typer.Option(
+        5, "--candidate-k", "-k", help="Number of hybrid candidates to retrieve (2–8)."
+    ),
+    function: Optional[str] = typer.Option(
+        None, "--function", "-f", help="Slide function filter (cover, content, section_divider, closing)."
+    ),
+    job: Optional[str] = typer.Option(
+        None, "--job", "-j", help="Primary communication job (explain, summarise, show_timeline, …)."
+    ),
+    archetype: Optional[list[str]] = typer.Option(
+        None, "--archetype", "-a", help="Preferred visual archetypes (repeatable)."
+    ),
+    role: Optional[list[str]] = typer.Option(
+        None, "--role", "-r", help="Required storyline roles (repeatable)."
+    ),
+    density: Optional[str] = typer.Option(
+        None, "--density", "-d", help="Density filter (low, medium, high)."
+    ),
+    required: Optional[list[str]] = typer.Option(
+        None, "--required", help="Required content element (repeatable)."
+    ),
+    strict_function: bool = typer.Option(
+        False, "--strict-function", help="Exclude slides that do not match --function exactly."
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Show which slides would be assessed without calling the vision API."
+    ),
+) -> None:
+    """Retrieve hybrid candidates, then rerank them with SAP AI Core vision.
+
+    Runs a hybrid search (semantic + metadata) to collect candidate_k slides,
+    then calls SAP AI Core Claude Vision ONCE to evaluate all candidates against
+    a five-dimension visual rubric. Prints the final vision-ranked list.
+
+    Use --dry-run to inspect the candidate set without making any API calls.
+    """
+    from slidestein.config import get_settings
+    from slidestein.domain.models import (
+        CommunicationJob,
+        DensityLevel,
+        SlideFunction,
+        StorylineRole,
+        VisualArchetype,
+    )
+    from slidestein.library.store import SlideLibrary
+    from slidestein.reranking.brief import build_visual_rerank_brief
+    from slidestein.reranking.providers.factory import create_vision_reranker
+    from slidestein.reranking.service import VisionSlideRerankService
+    from slidestein.retrieval.hybrid import HybridSlideSearch
+    from slidestein.retrieval.providers.factory import create_embedding_provider
+    from slidestein.retrieval.request import SlideRetrievalRequest
+    from slidestein.retrieval.store import SlideVectorStore
+
+    if not query.strip():
+        console.print("[red]Error:[/red] query must not be blank.")
+        raise typer.Exit(1)
+
+    if not (2 <= candidate_k <= 8):
+        console.print("[red]Error:[/red] --candidate-k must be between 2 and 8.")
+        raise typer.Exit(1)
+
+    fn_enum: Optional[SlideFunction] = None
+    if function is not None:
+        try:
+            fn_enum = SlideFunction(function)
+        except ValueError:
+            console.print(f"[red]Error:[/red] Unknown slide function: {function!r}")
+            raise typer.Exit(1)
+
+    job_enum: Optional[CommunicationJob] = None
+    if job is not None:
+        try:
+            job_enum = CommunicationJob(job)
+        except ValueError:
+            console.print(f"[red]Error:[/red] Unknown communication job: {job!r}")
+            raise typer.Exit(1)
+
+    archetype_enums: Optional[list[VisualArchetype]] = None
+    if archetype:
+        try:
+            archetype_enums = [VisualArchetype(a) for a in archetype]
+        except ValueError as exc:
+            console.print(f"[red]Error:[/red] Unknown archetype: {exc}")
+            raise typer.Exit(1)
+
+    role_enums: Optional[list[StorylineRole]] = None
+    if role:
+        try:
+            role_enums = [StorylineRole(r) for r in role]
+        except ValueError as exc:
+            console.print(f"[red]Error:[/red] Unknown storyline role: {exc}")
+            raise typer.Exit(1)
+
+    density_enum: Optional[DensityLevel] = None
+    if density is not None:
+        try:
+            density_enum = DensityLevel(density)
+        except ValueError:
+            console.print(f"[red]Error:[/red] Unknown density: {density!r}")
+            raise typer.Exit(1)
+
+    try:
+        request = SlideRetrievalRequest(
+            query_text=query,
+            slide_function=fn_enum,
+            primary_communication_job=job_enum,
+            preferred_visual_archetypes=archetype_enums or [],
+            storyline_roles=role_enums or [],
+            density=density_enum,
+            required_content_elements=required or [],
+            top_k=candidate_k,
+            strict_slide_function=strict_function,
+        )
+    except Exception as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(1)
+
+    settings = get_settings()
+
+    try:
+        provider = create_embedding_provider(settings)
+        store = SlideVectorStore(settings.lancedb_uri)
+        searcher = HybridSlideSearch(provider=provider, store=store)
+    except Exception as exc:
+        console.print(f"[red]Setup error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    if dry_run:
+        console.print(f"\n[bold cyan]Vision rerank — DRY RUN[/bold cyan]")
+        console.print(f"Query: [italic]{query}[/italic]")
+        console.print(f"Candidate k: {candidate_k}\n")
+        try:
+            results = searcher.search(request)
+        except Exception as exc:
+            console.print(f"[red]Search error:[/red] {exc}")
+            raise typer.Exit(1) from exc
+        if not results:
+            console.print("[dim]No results found.[/dim]")
+            return
+        console.print(f"[dim]Would send {len(results)} candidate(s) to vision API:[/dim]\n")
+        with SlideLibrary(settings.db_path, settings.lancedb_uri) as library:
+            for i, r in enumerate(results, 1):
+                record = library.get_slide(r.slide_id)
+                preview = record.preview_path if record else None
+                preview_status = (
+                    "[green]preview ok[/green]" if (preview and Path(preview).exists())
+                    else "[yellow]no preview[/yellow]"
+                )
+                console.print(
+                    f"  C{i}  Slide {r.slide_number} "
+                    f"([dim]{r.slide_id[:8]}…[/dim])  "
+                    f"hybrid={r.hybrid_score:.4f}  {preview_status}"
+                )
+        console.print("\n[dim](dry-run: no vision API call made)[/dim]")
+        return
+
+    try:
+        reranker = create_vision_reranker(settings)
+        with SlideLibrary(settings.db_path, settings.lancedb_uri) as library:
+            svc = VisionSlideRerankService(
+                searcher=searcher,
+                library=library,
+                reranker=reranker,
+            )
+            result = svc.rerank(request, candidate_k=candidate_k)
+    except Exception as exc:
+        console.print(f"[red]Vision rerank error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    console.print(f"\n[bold cyan]Vision rerank[/bold cyan]")
+    console.print(f"Query: [italic]{query}[/italic]\n")
+    console.print(
+        f"[green]Selected:[/green] Slide {result.selected_slide_number} "
+        f"([dim]{result.selected_slide_id[:8]}…[/dim])\n"
+    )
+
+    for r in result.ranked_candidates:
+        tier = "winner" if r.vision_rank == 1 else f"#{r.vision_rank}"
+        indicator = ">> " if r.vision_rank == 1 else "   "
+        console.print(
+            f"{indicator}[bold]{tier}[/bold]  Slide {r.slide_number} "
+            f"([dim]{r.slide_id[:8]}…[/dim])  "
+            f"visual={r.visual_score:.4f}  hybrid_rank={r.original_hybrid_rank}"
+        )
+        console.print(
+            f"     csf={r.communication_structure_fit} "
+            f"ccf={r.content_capacity_fit} "
+            f"vh={r.visual_hierarchy} "
+            f"af={r.argument_flow} "
+            f"df={r.density_fit}"
+        )
+        console.print(f"     {r.rationale}")
+        if r.strengths:
+            console.print(f"     strengths: {'; '.join(r.strengths)}")
+        if r.limitations:
+            console.print(f"     limits:    {'; '.join(r.limitations)}")
+        console.print()
+
+
 if __name__ == "__main__":
     app()

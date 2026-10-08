@@ -34,6 +34,9 @@ class Settings(BaseSettings):
     embedding_provider: str = "sap_ai_core"
     sap_ai_core_embedding_model: str = "text-embedding-3-large"
 
+    # Vision reranking provider: "sap_ai_core"
+    vision_rerank_provider: str = "sap_ai_core"
+
     # PPT Master integration (Milestone 2.5+)
     # pptmaster_python: set to the Python inside tools/pptmaster-env/ or leave
     # None for auto-discovery (looks for tools/pptmaster-env/Scripts/python.exe).
