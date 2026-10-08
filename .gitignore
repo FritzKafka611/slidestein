@@ -12,7 +12,11 @@ dist/
 # Generated output — not templates
 data/output/
 data/slidestein.db
+data/library.db
 data/lancedb/
+
+# Stray root-level databases from dev sessions
+*.db
 
 # Keep template slides out of version control unless explicitly added
 data/slides/*
