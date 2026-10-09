@@ -72,6 +72,19 @@ CREATE TABLE IF NOT EXISTS slide_classifications (
     classified_at          TEXT DEFAULT (datetime('now')),
     UNIQUE(slide_id, classification_version)
 );
+
+CREATE TABLE IF NOT EXISTS slide_slot_maps (
+    id                              INTEGER PRIMARY KEY,
+    slide_id                        TEXT NOT NULL,
+    slot_map_version                TEXT NOT NULL,
+    slot_analysis_input_fingerprint TEXT NOT NULL,
+    analysis_prompt_version         TEXT NOT NULL,
+    provider                        TEXT NOT NULL,
+    model                           TEXT NOT NULL,
+    analyzed_at                     TEXT DEFAULT (datetime('now')),
+    slot_map_json                   TEXT NOT NULL,
+    UNIQUE(slide_id, slot_map_version)
+);
 """
 
 # Columns to add to slide_records that may not exist in older databases.
@@ -598,6 +611,100 @@ class SlideLibrary:
         raise NotImplementedError(
             "Semantic search not yet implemented — index slides first, then implement LanceDB query"
         )
+
+    # ------------------------------------------------------------------
+    # Slot map persistence (M5.2)
+    # ------------------------------------------------------------------
+
+    def upsert_slot_map(
+        self,
+        slide_id: str,
+        version: str,
+        fingerprint: str,
+        prompt_version: str,
+        provider: str,
+        model: str,
+        slot_map_json: str,
+    ) -> None:
+        """Insert or replace a slot map for (slide_id, version)."""
+        conn = self._get_conn()
+        conn.execute(
+            """
+            INSERT INTO slide_slot_maps
+                (slide_id, slot_map_version, slot_analysis_input_fingerprint,
+                 analysis_prompt_version, provider, model, slot_map_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(slide_id, slot_map_version) DO UPDATE SET
+                slot_analysis_input_fingerprint = excluded.slot_analysis_input_fingerprint,
+                analysis_prompt_version = excluded.analysis_prompt_version,
+                provider = excluded.provider,
+                model = excluded.model,
+                slot_map_json = excluded.slot_map_json,
+                analyzed_at = datetime('now')
+            """,
+            (slide_id, version, fingerprint, prompt_version, provider, model, slot_map_json),
+        )
+        conn.commit()
+
+    def get_slot_map(
+        self,
+        slide_id: str,
+        version: str,
+    ) -> tuple[str, str, str] | None:
+        """Return (slot_map_json, fingerprint, analyzed_at) or None."""
+        row = self._get_conn().execute(
+            "SELECT slot_map_json, slot_analysis_input_fingerprint, analyzed_at "
+            "FROM slide_slot_maps WHERE slide_id = ? AND slot_map_version = ?",
+            (slide_id, version),
+        ).fetchone()
+        if row is None:
+            return None
+        return (str(row[0]), str(row[1]), str(row[2]) if row[2] else "")
+
+    def slot_map_is_current(
+        self,
+        slide_id: str,
+        version: str,
+        current_fingerprint: str,
+        provider: str = "",
+        model: str = "",
+    ) -> bool:
+        """Return True if a slot map exists and its fingerprint, provider, and model all match."""
+        row = self._get_conn().execute(
+            "SELECT slot_analysis_input_fingerprint, provider, model FROM slide_slot_maps "
+            "WHERE slide_id = ? AND slot_map_version = ?",
+            (slide_id, version),
+        ).fetchone()
+        if row is None:
+            return False
+        if str(row[0]) != current_fingerprint:
+            return False
+        if provider and str(row[1]) != provider:
+            return False
+        if model and str(row[2]) != model:
+            return False
+        return True
+
+    def list_slot_maps(
+        self,
+        version: str | None = None,
+    ) -> list[dict]:
+        """Return summary rows for all stored slot maps."""
+        if version:
+            rows = self._get_conn().execute(
+                "SELECT slide_id, slot_map_version, analyzed_at "
+                "FROM slide_slot_maps WHERE slot_map_version = ? ORDER BY slide_id",
+                (version,),
+            ).fetchall()
+        else:
+            rows = self._get_conn().execute(
+                "SELECT slide_id, slot_map_version, analyzed_at "
+                "FROM slide_slot_maps ORDER BY slide_id, slot_map_version"
+            ).fetchall()
+        return [
+            {"slide_id": r[0], "version": r[1], "analyzed_at": r[2] or ""}
+            for r in rows
+        ]
 
     # ------------------------------------------------------------------
     # Internal
