@@ -2117,5 +2117,227 @@ def apply_draft(
     console.print(f"\n[green]Done.[/green] Output written to {output}")
 
 
+@app.command("manager-review")
+def manager_review(
+    brief_path: Path = typer.Option(
+        ...,
+        "--brief",
+        "-b",
+        help="Path to ConsultingSlideBrief JSON file.",
+    ),
+    draft_path: Path = typer.Option(
+        ...,
+        "--draft",
+        "-d",
+        help="Path to SlideContentDraft JSON file.",
+    ),
+    slot_map_path: Path = typer.Option(
+        ...,
+        "--slot-map",
+        "-s",
+        help="Path to TemplateSlotMap JSON file.",
+    ),
+    source_file: Optional[Path] = typer.Option(
+        None,
+        "--source-file",
+        help="Optional path to source material text file.",
+    ),
+    source_text: Optional[str] = typer.Option(
+        None,
+        "--source-text",
+        help="Optional inline source material text (mutually exclusive with --source-file).",
+    ),
+    output: Optional[Path] = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help="Optional path to write ManagerReviewResult JSON.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Show K-key mapping and draft content — no LLM call.",
+    ),
+) -> None:
+    """Review a completed slide draft against a six-dimension quality rubric.
+
+    Requires a complete draft (is_complete=True).  Makes one SAP AI Core call
+    per review.  Use --dry-run to inspect the K-key mapping without spending a token.
+    """
+    from slidestein.briefing.brief import ConsultingSlideBrief  # noqa: PLC0415
+    from slidestein.drafting.models import SlideContentDraft  # noqa: PLC0415
+    from slidestein.drafting.service import build_slot_key_mapping  # noqa: PLC0415
+    from slidestein.review.errors import ManagerReviewError  # noqa: PLC0415
+    from slidestein.review.models import ManagerReviewRequest  # noqa: PLC0415
+    from slidestein.review.providers.factory import create_manager_reviewer  # noqa: PLC0415
+    from slidestein.review.providers.sap_aicore import ManagerReviewGenerationError  # noqa: PLC0415
+    from slidestein.review.service import ManagerReviewService  # noqa: PLC0415
+    from slidestein.slots.models import TemplateSlotMap  # noqa: PLC0415
+
+    if source_file is not None and source_text is not None:
+        console.print("[red]Error:[/red] --source-file and --source-text are mutually exclusive.")
+        raise typer.Exit(1)
+
+    # Load brief
+    try:
+        brief = ConsultingSlideBrief.model_validate_json(
+            brief_path.read_text(encoding="utf-8")
+        )
+    except Exception as exc:
+        console.print(f"[red]Failed to load brief:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    # Load draft
+    try:
+        draft = SlideContentDraft.model_validate_json(
+            draft_path.read_text(encoding="utf-8")
+        )
+    except Exception as exc:
+        console.print(f"[red]Failed to load draft:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    # Load slot map
+    try:
+        slot_map = TemplateSlotMap.model_validate_json(
+            slot_map_path.read_text(encoding="utf-8")
+        )
+    except Exception as exc:
+        console.print(f"[red]Failed to load slot map:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    # Load source material
+    material: Optional[str] = None
+    if source_file is not None:
+        try:
+            material = source_file.read_text(encoding="utf-8")
+        except Exception as exc:
+            console.print(f"[red]Failed to read source file:[/red] {exc}")
+            raise typer.Exit(1) from exc
+    elif source_text is not None:
+        material = source_text
+
+    # Dry-run: show K-key mapping without calling the LLM.
+    if dry_run:
+        key_map = build_slot_key_mapping(slot_map.slots)
+        console.print(
+            "\n[bold cyan]manager-review[/bold cyan]  [dim]dry run — no LLM call[/dim]"
+        )
+        console.print(f"  Slide:    {slot_map.slide_id}  (#{slot_map.slide_number})")
+        console.print(f"  Slots:    {len(key_map)}")
+        console.print(f"  Draft:    {'[green]COMPLETE[/green]' if draft.is_complete else '[yellow]INCOMPLETE[/yellow]'}")
+        console.print("\n  [bold]K-key mapping:[/bold]")
+        assignment_by_slot_id = {a.slot_id: a for a in draft.assignments}
+        for key, slot in key_map.items():
+            assignment = assignment_by_slot_id.get(slot.slot_id)
+            if assignment is not None:
+                action = assignment.action.value
+                text_preview = _safe_text((assignment.text or "")[:50])
+            else:
+                action = "clear"
+                text_preview = ""
+            console.print(
+                f"    {key:<5}  {slot.slot_role.value:<20}  "
+                f"[{action}]  {_safe_text(slot.semantic_label)}"
+                + (f"  {text_preview!r}" if text_preview else "")
+            )
+        return
+
+    # Check completeness before creating reviewer (saves a configuration validation call).
+    if not draft.is_complete:
+        console.print(
+            "[red]Error:[/red] Draft is not complete (is_complete=False). "
+            "Manager review requires a fully complete draft."
+        )
+        raise typer.Exit(1)
+
+    # Real review.
+    from slidestein.config import get_settings  # noqa: PLC0415
+
+    settings = get_settings()
+    try:
+        reviewer = create_manager_reviewer(settings)
+    except ValueError as exc:
+        console.print(f"[red]Reviewer configuration error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    service = ManagerReviewService(reviewer=reviewer)
+    request = ManagerReviewRequest(
+        brief=brief,
+        draft=draft,
+        slot_map=slot_map,
+        source_material=material,
+    )
+
+    console.print(
+        f"\n[bold cyan]manager-review[/bold cyan]  {slot_map.slide_id}  (#{slot_map.slide_number})"
+    )
+
+    try:
+        result = service.review(request)
+    except ManagerReviewError as exc:
+        console.print(f"[red]Review failed:[/red] {exc}")
+        raise typer.Exit(1) from exc
+    except ManagerReviewGenerationError as exc:
+        console.print(f"[red]Review failed:[/red] {exc}")
+        raise typer.Exit(1) from exc
+    except Exception as exc:
+        console.print(f"[red]Unexpected error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    # Display result
+    if result.recommendation == "approve":
+        rec_display = "[green]APPROVE[/green]"
+    else:
+        rec_display = "[red]REVISE[/red]"
+
+    console.print(f"\n  Recommendation:  {rec_display}")
+    console.print(f"  Average score:   {result.average_score:.2f} / 5.00")
+
+    console.print("\n  [bold]Dimension scores:[/bold]")
+    dimensions = [
+        ("answer_first_title", result.answer_first_title),
+        ("core_message_clarity", result.core_message_clarity),
+        ("vertical_logic", result.vertical_logic),
+        ("exhibit_title_consistency", result.exhibit_title_consistency),
+        ("mece_structure", result.mece_structure),
+        ("content_density", result.content_density),
+    ]
+    for dim_name, dim in dimensions:
+        score_color = "green" if dim.score >= 4 else ("yellow" if dim.score == 3 else "red")
+        console.print(
+            f"    {dim_name:<30}  [{score_color}]{dim.score}[/{score_color}]  "
+            f"{_safe_text(dim.rationale[:80])}"
+        )
+
+    if result.issues:
+        console.print(f"\n  [bold]Issues ({len(result.issues)}):[/bold]")
+        for issue in result.issues:
+            sev_color = "red" if issue.severity == "critical" else (
+                "yellow" if issue.severity == "major" else "dim"
+            )
+            slot_ref = f"  [{', '.join(issue.slot_keys)}]" if issue.slot_keys else ""
+            console.print(
+                f"    [{sev_color}]{issue.severity:<8}[/{sev_color}]  "
+                f"{issue.category}{slot_ref}"
+            )
+            console.print(f"      {_safe_text(issue.issue[:100])}")
+
+    if result.factual_flags:
+        console.print(f"\n  [bold]Factual flags ({len(result.factual_flags)}):[/bold]")
+        for flag in result.factual_flags:
+            console.print(f"    - {_safe_text(flag[:100])}")
+
+    console.print(f"\n  [bold]Executive summary:[/bold]")
+    console.print(f"  {_safe_text(result.executive_summary)}")
+
+    if output is not None:
+        try:
+            output.write_text(result.model_dump_json(indent=2), encoding="utf-8")
+            console.print(f"\n[green]Review result written to:[/green] {output}")
+        except Exception as exc:
+            console.print(f"[red]Failed to write output:[/red] {exc}")
+            raise typer.Exit(1) from exc
+
+
 if __name__ == "__main__":
     app()
