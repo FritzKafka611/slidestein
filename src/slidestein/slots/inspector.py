@@ -279,3 +279,41 @@ class SlideShapeInspector:
             slide_height = 5143500  # 5.625 inches default
 
         return _walk_shapes(slide.shapes, None, 0, slide_width, slide_height)
+
+
+def inspect_slide(pptx_path: Path, slide_number: int) -> list[NativeShapeDescriptor]:
+    """Inspect a slide directly by path and ordinal — no SlideRecord needed.
+
+    Convenience wrapper for callers (e.g. preflight) that have a PPTX path and
+    1-indexed slide number but no SlideRecord.
+
+    Raises:
+        FileNotFoundError: if pptx_path does not exist.
+        ValueError: if slide_number is out of range.
+        RuntimeError: if python-pptx fails to open the file.
+    """
+    if not pptx_path.exists():
+        raise FileNotFoundError(f"Source deck not found: {pptx_path}")
+
+    try:
+        prs = Presentation(str(pptx_path))
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to open {pptx_path}: {type(exc).__name__}: {exc}"
+        ) from exc
+
+    if slide_number < 1 or slide_number > len(prs.slides):
+        raise ValueError(
+            f"Slide number {slide_number} out of range "
+            f"(deck has {len(prs.slides)} slide(s))"
+        )
+
+    slide = prs.slides[slide_number - 1]
+    try:
+        slide_width = int(prs.slide_width)
+        slide_height = int(prs.slide_height)
+    except Exception:
+        slide_width = 9144000
+        slide_height = 5143500
+
+    return _walk_shapes(slide.shapes, None, 0, slide_width, slide_height)

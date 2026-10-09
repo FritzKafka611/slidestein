@@ -23,6 +23,39 @@ def compute_slot_id(slide_id: str, shape_path: str) -> str:
     return str(uuid.uuid5(_SLOT_ID_NAMESPACE, key))
 
 
+def build_candidate_fingerprint_list(descriptors: list) -> list[dict]:
+    """Build the sorted candidate entry list used by compute_slot_analysis_input_fingerprint.
+
+    Filters to editable descriptors, sorts by (y, x), assigns S1..Sn keys.
+    Accepts NativeShapeDescriptor instances or any objects with the required attributes.
+
+    This is the canonical implementation — used by both M5.2 analysis and M6 source-
+    currentness checking to ensure fingerprints are computed identically.
+    """
+    editable = [d for d in descriptors if d.can_edit_text]
+    editable_sorted = sorted(editable, key=lambda d: (d.y, d.x))
+    pairs: list[tuple[str, dict]] = []
+    for i, d in enumerate(editable_sorted):
+        key = f"S{i + 1}"
+        pairs.append((
+            key,
+            {
+                "key": key,
+                "shape_path": d.shape_path,
+                "shape_type": d.shape_type,
+                "x": d.x,
+                "y": d.y,
+                "width": d.width,
+                "height": d.height,
+                "can_edit_text": d.can_edit_text,
+                "text": d.text,
+            },
+        ))
+    # Sort by key lexicographically to match M5.2 service.py (sorted(candidates.items())).
+    # Lexicographic order matters for slides with ≥10 candidates: S1, S10, S11, ..., S2, ...
+    return [entry for _, entry in sorted(pairs, key=lambda p: p[0])]
+
+
 def compute_slot_analysis_input_fingerprint(
     slide_id: str,
     candidates: list[dict],  # ordered list of compact candidate dicts

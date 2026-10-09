@@ -1975,5 +1975,147 @@ def draft_content(
             raise typer.Exit(1) from exc
 
 
+@app.command("apply-draft")
+def apply_draft(
+    draft_path: Path = typer.Option(
+        ..., "--draft", "-d", help="Path to SlideContentDraft JSON."
+    ),
+    slot_map_path: Path = typer.Option(
+        ..., "--slot-map", "-s", help="Path to TemplateSlotMap JSON."
+    ),
+    source: Path = typer.Option(
+        ..., "--source", help="Path to the source PPTX deck."
+    ),
+    output: Path = typer.Option(
+        ..., "--output", "-o", help="Path to write the modified PPTX output."
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Validate and show the plan without writing."
+    ),
+    overwrite: bool = typer.Option(
+        False, "--overwrite", help="Overwrite output if it already exists."
+    ),
+) -> None:
+    """Apply a completed content draft to a PPTX deck via PowerPoint COM (M6).
+
+    Loads a SlideContentDraft and TemplateSlotMap, runs all preflight checks,
+    and writes the modified slide to the output PPTX.  The source deck is never
+    modified.
+
+    Use --dry-run to validate the plan without making any file changes.
+    Only complete drafts (is_complete=True) are accepted.  No LLM calls.
+    """
+    from slidestein.drafting.models import SlideContentDraft  # noqa: PLC0415
+    from slidestein.slots.models import TemplateSlotMap  # noqa: PLC0415
+    from slidestein.writeback.errors import PowerPointWritebackError  # noqa: PLC0415
+    from slidestein.writeback.models import PowerPointWritebackRequest  # noqa: PLC0415
+    from slidestein.writeback.service import PowerPointWritebackService  # noqa: PLC0415
+
+    # --- load draft ----------------------------------------------------------
+    try:
+        draft = SlideContentDraft.model_validate_json(
+            draft_path.read_text(encoding="utf-8")
+        )
+    except Exception as exc:
+        console.print(f"[red]Failed to load draft:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    # --- load slot map -------------------------------------------------------
+    try:
+        slot_map = TemplateSlotMap.model_validate_json(
+            slot_map_path.read_text(encoding="utf-8")
+        )
+    except Exception as exc:
+        console.print(f"[red]Failed to load slot map:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    # --- build request -------------------------------------------------------
+    try:
+        request = PowerPointWritebackRequest(
+            draft=draft,
+            slot_map=slot_map,
+            source_pptx=source,
+            output_pptx=output,
+            overwrite=overwrite,
+        )
+    except Exception as exc:
+        console.print(f"[red]Invalid request:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    svc = PowerPointWritebackService()
+
+    # --- preflight -----------------------------------------------------------
+    try:
+        plan = svc.preflight(request)
+    except PowerPointWritebackError as exc:
+        console.print(f"[red]Preflight failed:[/red] {exc}")
+        raise typer.Exit(1) from exc
+    except Exception as exc:
+        console.print(f"[red]Unexpected preflight error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    console.print(
+        f"\n[bold cyan]apply-draft[/bold cyan]"
+        + ("  [dim](dry run)[/dim]" if dry_run else "")
+    )
+    slide_info = f"slide #{plan.slide_number}"
+    if plan.resolved_slide_number != plan.slide_number:
+        slide_info += f" (resolved to #{plan.resolved_slide_number} after reorder)"
+    console.print(f"  Slide:      {plan.slide_id}  ({slide_info})")
+    if plan.native_slide_id is not None:
+        console.print(f"  Native ID:  {plan.native_slide_id}")
+    console.print(f"  Source:     {plan.source_pptx.name}")
+    console.print(f"  Output:     {plan.output_pptx}")
+    console.print(f"  Replace:    {plan.replacement_count} slot(s)")
+    console.print(f"  Clear:      {plan.clear_count} slot(s)")
+    fp_str = plan.before_structure_fingerprint
+    if fp_str:
+        console.print(f"  Fingerprint before: [dim]{fp_str[:16]}...[/dim]")
+
+    if plan.operations:
+        console.print("\n  [bold]Operations:[/bold]")
+        for op in plan.operations:
+            if op.action.value == "replace":
+                text_preview = (op.text or "")[:60].replace("\n", " | ")
+                console.print(
+                    f"    [green]replace[/green]  {op.slot_id[:24]}  "
+                    f"shape={op.shape_path}  "
+                    f"{text_preview!r}"
+                )
+            else:
+                console.print(
+                    f"    [dim]clear   [/dim]  {op.slot_id[:24]}  shape={op.shape_path}"
+                )
+
+    if dry_run:
+        console.print("\n[dim]Dry run complete — no files written.[/dim]")
+        return
+
+    # --- apply ---------------------------------------------------------------
+    try:
+        result = svc.apply(plan)
+    except PowerPointWritebackError as exc:
+        console.print(f"[red]Write-back failed:[/red] {exc}")
+        raise typer.Exit(1) from exc
+    except Exception as exc:
+        console.print(f"[red]Unexpected error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    status = "[green]PASSED[/green]" if result.verification_passed else "[red]FAILED[/red]"
+    console.print(f"\n  Verification: {status}")
+    console.print(f"  Source current:     {'yes' if result.source_currentness_verified else '[red]NO[/red]'}")
+    console.print(f"  Target structure:   {'ok' if result.target_structure_verified else '[red]CHANGED[/red]'}")
+    console.print(f"  Non-target slides:  {'ok' if result.non_target_structure_verified else '[red]CHANGED[/red]'}")
+    if result.after_structure_fingerprint:
+        console.print(
+            f"  Fingerprint after:  [dim]{result.after_structure_fingerprint[:16]}...[/dim]"
+        )
+
+    for w in result.warnings:
+        console.print(f"  [yellow]Warning:[/yellow] {w}")
+
+    console.print(f"\n[green]Done.[/green] Output written to {output}")
+
+
 if __name__ == "__main__":
     app()
