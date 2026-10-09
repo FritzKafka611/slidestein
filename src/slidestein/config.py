@@ -40,6 +40,19 @@ class Settings(BaseSettings):
     # Slide brief generation provider: "sap_ai_core"
     slide_brief_provider: str = "sap_ai_core"
 
+    # Slot analysis provider (M5.2): "sap_ai_core"
+    slot_analysis_provider: str = "sap_ai_core"
+    # sap_ai_core_model (shared with reranking/briefing/classification) is the
+    # model used for all SAP AI Core Orchestration V2 calls including slot
+    # analysis Vision.  sap_ai_core_vision_model was removed (was unused and
+    # caused confusion during evaluation).
+
+    sap_ai_core_base_url: Optional[str] = None
+    sap_ai_core_client_id: Optional[str] = None
+    sap_ai_core_client_secret: Optional[str] = None
+    sap_ai_core_auth_url: Optional[str] = None
+    sap_ai_core_resource_group: str = "default"
+
     # PPT Master integration (Milestone 2.5+)
     # pptmaster_python: set to the Python inside tools/pptmaster-env/ or leave
     # None for auto-discovery (looks for tools/pptmaster-env/Scripts/python.exe).

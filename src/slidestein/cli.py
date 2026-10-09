@@ -1652,5 +1652,165 @@ def generate_brief(
             raise typer.Exit(1) from exc
 
 
+def _safe_text(s: str) -> str:
+    """Replace characters unmappable in cp1252 so Rich doesn't crash on Windows."""
+    return s.encode("cp1252", errors="replace").decode("cp1252")
+
+
+@app.command("analyze-slots")
+def analyze_slots(
+    slide_id: str = typer.Argument(..., help="Slide ID to analyse."),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Re-analyse even if a current cached result exists.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Inspect shapes and show candidates without making a Vision call.",
+    ),
+    output: Optional[Path] = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help="Write TemplateSlotMap JSON to this path.",
+    ),
+    slide_number: Optional[int] = typer.Option(
+        None,
+        "--slide-number",
+        "-n",
+        help="For display only — the canonical identity is always slide_id.",
+    ),
+) -> None:
+    """Analyse the slot structure of a slide template (M5.2).
+
+    Inspects the slide natively, then calls Vision once to classify semantic
+    roles.  Results are cached in the library.
+
+    Use --dry-run to inspect shape candidates without spending a Vision token.
+    Use --force to bypass the cache and re-analyse.
+    """
+    from slidestein.config import get_settings  # noqa: PLC0415
+    from slidestein.library.store import SlideLibrary  # noqa: PLC0415
+    from slidestein.slots.providers.factory import create_slot_semantic_analyzer  # noqa: PLC0415
+    from slidestein.slots.providers.sap_aicore import SlotAnalysisError  # noqa: PLC0415
+    from slidestein.slots.service import TemplateSlotAnalysisService  # noqa: PLC0415
+
+    settings = get_settings()
+
+    analyzer = None
+    if not dry_run:
+        try:
+            analyzer = create_slot_semantic_analyzer(settings)
+        except ValueError as exc:
+            console.print(f"[red]Analyzer configuration error:[/red] {exc}")
+            raise typer.Exit(1) from exc
+
+    with SlideLibrary(settings.db_path, settings.lancedb_uri) as library:
+        service = TemplateSlotAnalysisService(
+            library=library,
+            analyzer=analyzer,
+            provider_name=settings.slot_analysis_provider,
+            model_name=settings.sap_ai_core_model,
+        )
+
+        if dry_run:
+            console.print(
+                f"[bold cyan]analyze-slots[/bold cyan]  "
+                f"[dim]dry run — no Vision call[/dim]"
+            )
+        else:
+            console.print(
+                f"[bold cyan]analyze-slots[/bold cyan]  {slide_id}"
+            )
+
+        try:
+            slot_map = service.analyze(slide_id=slide_id, force=force, dry_run=dry_run)
+        except ValueError as exc:
+            console.print(f"[red]Error:[/red] {exc}")
+            raise typer.Exit(1) from exc
+        except SlotAnalysisError as exc:
+            console.print(f"[red]Slot analysis error:[/red] {exc}")
+            raise typer.Exit(1) from exc
+        except Exception as exc:
+            console.print(f"[red]Unexpected error:[/red] {exc}")
+            raise typer.Exit(1) from exc
+
+    if dry_run:
+        console.print(f"\n  Slide:       {slide_id}")
+        if slide_number:
+            console.print(f"  Slide number (display): {slide_number}")
+        console.print(f"  Slide #{slot_map.slide_number}")
+        console.print(f"  Summary:     {slot_map.analysis_summary}")
+        console.print(
+            f"\n  [dim]No slots assigned (dry run). "
+            f"Non-editable: {len(slot_map.non_editable_elements)}, "
+            f"Unsupported: {len(slot_map.unsupported_elements)}[/dim]"
+        )
+        if slot_map.candidate_map:
+            console.print(f"\n  [bold]Candidates ({len(slot_map.candidate_map)}):[/bold]")
+            for c in slot_map.candidate_map:
+                cap = c.get("capacity", {})
+                console.print(
+                    f"\n  [cyan]{c['candidate_key']}[/cyan]"
+                    f"\n    shape_path:  {c['shape_path']}"
+                    f"\n    shape_id:    {c['shape_id']}"
+                    f"\n    source_kind: {c['source_kind']}"
+                    f"\n    text:        {_safe_text(c.get('text_preview','')[:60] or '(empty)')!r}"
+                    f"\n    editable:    {c['can_edit_text']}"
+                    f"\n    position:    x={c['x_ratio']:.3f}  y={c['y_ratio']:.3f}"
+                    f"  w={c['width_ratio']:.3f}  h={c['height_ratio']:.3f}"
+                    f"\n    capacity:    {cap.get('relative_capacity','')}  "
+                    f"~{cap.get('max_characters_estimate',0)} chars  "
+                    f"{cap.get('max_lines_estimate',0)} lines"
+                )
+        console.print(
+            f"\n  Fingerprint: [dim]{slot_map.slot_analysis_input_fingerprint}[/dim]"
+        )
+    else:
+        console.print(f"\n  Slide:       {slide_id}")
+        console.print(f"  Slide #:     {slot_map.slide_number}")
+        console.print(f"  Slots:       {len(slot_map.slots)}")
+        console.print(f"  Groups:      {len(slot_map.groups)}")
+        console.print(
+            f"  Non-editable (native): {len(slot_map.non_editable_elements)}"
+        )
+        console.print(
+            f"  Vision-declined (editable): {len(slot_map.excluded_editable_candidates)}"
+        )
+        console.print(
+            f"  Unsupported:  {len(slot_map.unsupported_elements)}"
+        )
+        if slot_map.slots:
+            console.print("\n  [bold]Slots:[/bold]")
+            for sl in slot_map.slots:
+                edit_flag = "[green]editable[/green]" if sl.editable else "[dim]read-only[/dim]"
+                console.print(
+                    f"    {sl.slot_id[:8]}…  {sl.slot_role.value:<20}  "
+                    f"{edit_flag}  conf={sl.confidence:.2f}  "
+                    f"{_safe_text(sl.semantic_label)}"
+                )
+        if slot_map.groups:
+            console.print("\n  [bold]Groups:[/bold]")
+            for g in slot_map.groups:
+                console.print(
+                    f"    {_safe_text(g.group_id)}  ({_safe_text(g.group_role or '')})  "
+                    f"members: {len(g.member_slot_ids)}"
+                )
+        console.print(f"\n  [bold]Summary:[/bold] {_safe_text(slot_map.analysis_summary)}")
+        console.print(
+            f"\n  Fingerprint: [dim]{slot_map.slot_analysis_input_fingerprint}[/dim]"
+        )
+
+    if output is not None:
+        try:
+            output.write_text(slot_map.model_dump_json(indent=2), encoding="utf-8")
+            console.print(f"\n[green]Slot map written to:[/green] {output}")
+        except Exception as exc:
+            console.print(f"[red]Failed to write output:[/red] {exc}")
+            raise typer.Exit(1) from exc
+
+
 if __name__ == "__main__":
     app()
