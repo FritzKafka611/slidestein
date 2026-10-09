@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     # Vision reranking provider: "sap_ai_core"
     vision_rerank_provider: str = "sap_ai_core"
 
+    # Slide brief generation provider: "sap_ai_core"
+    slide_brief_provider: str = "sap_ai_core"
+
     # PPT Master integration (Milestone 2.5+)
     # pptmaster_python: set to the Python inside tools/pptmaster-env/ or leave
     # None for auto-discovery (looks for tools/pptmaster-env/Scripts/python.exe).
