@@ -1555,5 +1555,102 @@ def vision_rerank(
         console.print()
 
 
+@app.command("generate-brief")
+def generate_brief(
+    request: str = typer.Argument(..., help="Natural-language slide request."),
+    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Write brief JSON to file."),
+    show_retrieval_request: bool = typer.Option(
+        False, "--show-retrieval-request", help="Display the mapped SlideRetrievalRequest."
+    ),
+) -> None:
+    """Generate a ConsultingSlideBrief from a natural-language request."""
+    from slidestein.briefing.adapter import brief_to_retrieval_request  # noqa: PLC0415
+    from slidestein.briefing.providers.factory import create_slide_brief_generator  # noqa: PLC0415
+    from slidestein.briefing.providers.sap_aicore import SlideBriefGenerationError  # noqa: PLC0415
+    from slidestein.config import get_settings  # noqa: PLC0415
+
+    if not request.strip():
+        console.print("[red]Error:[/red] Request must not be blank.")
+        raise typer.Exit(1)
+
+    settings = get_settings()
+    try:
+        generator = create_slide_brief_generator(settings)
+        brief = generator.generate(request)
+    except SlideBriefGenerationError as exc:
+        console.print(f"[red]Brief generation error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+    except Exception as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    console.print(f"\n[bold cyan]Generate brief[/bold cyan]")
+    console.print(f"Query: [italic]{request}[/italic]\n")
+
+    console.print("  [bold]Key message:[/bold]")
+    console.print(f"    {brief.key_message}\n")
+
+    primary_val = brief.primary_communication_job.value if brief.primary_communication_job else "(none)"
+    sec_jobs = ", ".join(j.value for j in brief.secondary_communication_jobs) or "(none)"
+    roles = ", ".join(r.value for r in brief.storyline_roles) or "(none)"
+    archetypes = ", ".join(a.value for a in brief.preferred_visual_archetypes) or "(none)"
+    density_val = brief.density.value if brief.density else "(unspecified)"
+
+    console.print(f"  Slide function:       {brief.slide_function.value}")
+    console.print(f"  Communication job:    {primary_val}")
+    console.print(f"  Secondary jobs:       {sec_jobs}")
+    console.print(f"  Storyline roles:      {roles}")
+    console.print(f"  Preferred archetypes: {archetypes}")
+    console.print(f"  Density:              {density_val}\n")
+
+    if brief.required_content_elements:
+        console.print("  [bold]Required content:[/bold]")
+        for elem in brief.required_content_elements:
+            console.print(f"    - {elem}")
+        console.print()
+
+    console.print("  [bold]Assumptions:[/bold]")
+    if brief.assumptions:
+        for assumption in brief.assumptions:
+            console.print(f"    - {assumption}")
+    else:
+        console.print("    (none)")
+    console.print()
+
+    console.print("  [bold]Open questions:[/bold]")
+    if brief.open_questions:
+        for question in brief.open_questions:
+            console.print(f"    - {question}")
+    else:
+        console.print("    (none)")
+
+    if show_retrieval_request:
+        rr = brief_to_retrieval_request(brief)
+        pcj = rr.primary_communication_job.value if rr.primary_communication_job else "null"
+        roles_r = ", ".join(r.value for r in rr.storyline_roles) or "(none)"
+        archs_r = ", ".join(a.value for a in rr.preferred_visual_archetypes) or "(none)"
+        req_content = ", ".join(rr.required_content_elements) or "(none)"
+        density_r = rr.density.value if rr.density else "null"
+        console.print("\n  [bold]Retrieval request (deterministic mapping):[/bold]")
+        console.print(f"    query_text:    {rr.query_text}")
+        console.print("    [dim](key_message is NOT used as query — preserves original wording)[/dim]")
+        console.print(f"    slide_function:            {rr.slide_function.value}")
+        console.print(f"    primary_communication_job: {pcj}")
+        console.print(f"    storyline_roles:           {roles_r}")
+        console.print(f"    preferred_archetypes:      {archs_r}")
+        console.print(f"    density:                   {density_r}")
+        console.print(f"    required_content:          {req_content}")
+        console.print(f"    top_k:                     {rr.top_k}")
+        console.print("    [dim][note] secondary_communication_jobs not forwarded to retrieval in M5.1[/dim]")
+
+    if output is not None:
+        try:
+            output.write_text(brief.model_dump_json(indent=2), encoding="utf-8")
+            console.print(f"\n[green]Brief written to:[/green] {output}")
+        except Exception as exc:
+            console.print(f"[red]Failed to write output:[/red] {exc}")
+            raise typer.Exit(1) from exc
+
+
 if __name__ == "__main__":
     app()
