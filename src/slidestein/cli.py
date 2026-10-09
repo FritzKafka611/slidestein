@@ -1812,5 +1812,168 @@ def analyze_slots(
             raise typer.Exit(1) from exc
 
 
+@app.command("draft-content")
+def draft_content(
+    brief_path: Path = typer.Option(
+        ..., "--brief", "-b", help="Path to ConsultingSlideBrief JSON."
+    ),
+    slot_map_path: Path = typer.Option(
+        ..., "--slot-map", "-s", help="Path to TemplateSlotMap JSON."
+    ),
+    source_file: Optional[Path] = typer.Option(
+        None, "--source-file", help="Read factual source material from file."
+    ),
+    source_text: Optional[str] = typer.Option(
+        None, "--source-text", help="Inline factual source material string."
+    ),
+    output: Optional[Path] = typer.Option(
+        None, "--output", "-o", help="Write SlideContentDraft JSON to file."
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Show K-key mapping without making an LLM call."
+    ),
+) -> None:
+    """Draft text content for every slot in a slide template (M5.3).
+
+    Reads a ConsultingSlideBrief and TemplateSlotMap, then calls the content
+    draft generator once to assign text to each semantic slot.
+
+    Use --dry-run to inspect the K-key mapping without spending a token.
+    """
+    from slidestein.briefing.brief import ConsultingSlideBrief  # noqa: PLC0415
+    from slidestein.config import get_settings  # noqa: PLC0415
+    from slidestein.drafting.providers.factory import create_content_draft_generator  # noqa: PLC0415
+    from slidestein.drafting.providers.sap_aicore import ContentDraftGenerationError  # noqa: PLC0415
+    from slidestein.drafting.service import (  # noqa: PLC0415
+        SlideContentDraftService,
+        build_slot_key_mapping,
+    )
+    from slidestein.slots.models import TemplateSlotMap  # noqa: PLC0415
+
+    if source_file is not None and source_text is not None:
+        console.print("[red]Error:[/red] --source-file and --source-text are mutually exclusive.")
+        raise typer.Exit(1)
+
+    # Load brief
+    try:
+        brief = ConsultingSlideBrief.model_validate_json(
+            brief_path.read_text(encoding="utf-8")
+        )
+    except Exception as exc:
+        console.print(f"[red]Failed to load brief:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    # Load slot map
+    try:
+        slot_map = TemplateSlotMap.model_validate_json(
+            slot_map_path.read_text(encoding="utf-8")
+        )
+    except Exception as exc:
+        console.print(f"[red]Failed to load slot map:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    # Load source material
+    material: Optional[str] = None
+    if source_file is not None:
+        try:
+            material = source_file.read_text(encoding="utf-8")
+        except Exception as exc:
+            console.print(f"[red]Failed to read source file:[/red] {exc}")
+            raise typer.Exit(1) from exc
+    elif source_text is not None:
+        material = source_text
+
+    # Dry-run: show K-key mapping without calling the LLM.
+    if dry_run:
+        key_map = build_slot_key_mapping(slot_map.slots)
+        console.print(
+            f"\n[bold cyan]draft-content[/bold cyan]  [dim]dry run — no LLM call[/dim]"
+        )
+        console.print(f"  Slide:  {slot_map.slide_id}  (#{slot_map.slide_number})")
+        console.print(f"  Slots:  {len(key_map)}")
+        console.print(f"\n  [bold]K-key mapping:[/bold]")
+        for key, slot in key_map.items():
+            cap = slot.capacity
+            console.print(
+                f"    {key:<5}  {slot.slot_role.value:<20}  "
+                f"~{cap.max_characters_estimate} chars  "
+                f"{_safe_text(slot.semantic_label)}"
+            )
+        return
+
+    # Real draft.
+    settings = get_settings()
+    try:
+        generator = create_content_draft_generator(settings)
+    except ValueError as exc:
+        console.print(f"[red]Generator configuration error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    service = SlideContentDraftService(generator=generator)
+
+    console.print(
+        f"\n[bold cyan]draft-content[/bold cyan]  {slot_map.slide_id}  (#{slot_map.slide_number})"
+    )
+
+    try:
+        draft = service.draft(brief=brief, slot_map=slot_map, source_material=material)
+    except ContentDraftGenerationError as exc:
+        console.print(f"[red]Content draft error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+    except Exception as exc:
+        console.print(f"[red]Unexpected error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    status = "[green]COMPLETE[/green]" if draft.is_complete else "[yellow]INCOMPLETE[/yellow]"
+    console.print(f"\n  Status:   {status}")
+    console.print(f"  Slots:    {len(draft.assignments)}")
+    replace_count = sum(1 for a in draft.assignments if a.action.value == "replace")
+    clear_count = sum(1 for a in draft.assignments if a.action.value == "clear")
+    ni_count = sum(1 for a in draft.assignments if a.action.value == "needs_input")
+    console.print(f"  replace:  {replace_count}  |  clear: {clear_count}  |  needs_input: {ni_count}")
+    console.print(f"\n  [bold]Summary:[/bold] {_safe_text(draft.drafting_summary)}")
+
+    if draft.open_questions:
+        console.print("\n  [bold]Open questions:[/bold]")
+        for q in draft.open_questions:
+            console.print(f"    - {_safe_text(q)}")
+
+    if not draft.is_complete:
+        console.print("\n  [bold yellow]Needs input:[/bold yellow]")
+        for a in draft.assignments:
+            if a.action.value == "needs_input":
+                console.print(
+                    f"    {_safe_text(a.semantic_label)}: "
+                    f"{_safe_text(a.missing_information or '')}"
+                )
+
+    console.print("\n  [bold]Assignments:[/bold]")
+    for a in draft.assignments:
+        if a.action.value == "replace":
+            preview = _safe_text((a.text or "")[:60])
+            util_pct = int(a.capacity_utilization * 100)
+            console.print(
+                f"    [green]replace[/green]  {_safe_text(a.semantic_label):<28}  "
+                f"{util_pct:>3}%  {preview!r}"
+            )
+        elif a.action.value == "clear":
+            console.print(
+                f"    [dim]clear  [/dim]  {_safe_text(a.semantic_label)}"
+            )
+        else:
+            console.print(
+                f"    [yellow]needs_input[/yellow]  {_safe_text(a.semantic_label):<24}  "
+                f"{_safe_text(a.missing_information or '')[:60]}"
+            )
+
+    if output is not None:
+        try:
+            output.write_text(draft.model_dump_json(indent=2), encoding="utf-8")
+            console.print(f"\n[green]Draft written to:[/green] {output}")
+        except Exception as exc:
+            console.print(f"[red]Failed to write output:[/red] {exc}")
+            raise typer.Exit(1) from exc
+
+
 if __name__ == "__main__":
     app()
