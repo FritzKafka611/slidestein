@@ -180,7 +180,14 @@ class TemplateSlotAnalysisService:
             ):
                 cached = self._library.get_slot_map(slide_id, SLOT_MAP_SCHEMA_VERSION)  # type: ignore[union-attr]
                 if cached is not None:
-                    return TemplateSlotMap.model_validate_json(cached[0])
+                    from slidestein.slots.migration import exclusion_changed, normalize_cached_slot_map  # noqa: PLC0415
+                    raw_map = TemplateSlotMap.model_validate_json(cached[0])
+                    normalized = normalize_cached_slot_map(raw_map, descriptors)
+                    if exclusion_changed(raw_map, normalized):
+                        self._library.patch_slot_map_json(  # type: ignore[union-attr]
+                            slide_id, SLOT_MAP_SCHEMA_VERSION, normalized.model_dump_json()
+                        )
+                    return normalized
 
         # ---------------------------------------------------------------
         # 5. Classify shapes into editable / non-editable / unsupported

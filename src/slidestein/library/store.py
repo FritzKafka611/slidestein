@@ -685,6 +685,21 @@ class SlideLibrary:
             return False
         return True
 
+    def patch_slot_map_json(
+        self,
+        slide_id: str,
+        version: str,
+        slot_map_json: str,
+    ) -> None:
+        """Update only slot_map_json, preserving analyzed_at and all other metadata."""
+        conn = self._get_conn()
+        conn.execute(
+            "UPDATE slide_slot_maps SET slot_map_json = ? "
+            "WHERE slide_id = ? AND slot_map_version = ?",
+            (slot_map_json, slide_id, version),
+        )
+        conn.commit()
+
     def list_slot_maps(
         self,
         version: str | None = None,
