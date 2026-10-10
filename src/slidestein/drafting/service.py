@@ -30,6 +30,36 @@ from slidestein.drafting.versions import CONTENT_DRAFT_SCHEMA_VERSION
 from slidestein.slots.models import SlotGroup, TemplateSlot, TemplateSlotMap
 
 _MAX_EXAMPLE_CHARS = 80
+
+
+# ---------------------------------------------------------------------------
+# Shared capacity validation helper (reused by M5.3 and M9)
+# ---------------------------------------------------------------------------
+
+
+def validate_text_capacity(
+    text: str,
+    max_chars: int,
+    max_lines: int,
+    key: str,
+    error_factory,
+) -> None:
+    """Raise error_factory(msg) if text exceeds hard character or line limits.
+
+    Does NOT truncate, resize, or modify the text — only validates.
+    """
+    char_count = len(text)
+    if max_chars > 0 and char_count > max_chars:
+        raise error_factory(
+            f"Revised text for {key} exceeds capacity: "
+            f"{char_count} chars > {max_chars} max"
+        )
+    line_count = text.count("\n") + 1
+    if max_lines > 0 and line_count > max_lines:
+        raise error_factory(
+            f"Revised text for {key} exceeds line limit: "
+            f"{line_count} lines > {max_lines} max"
+        )
 _CAPACITY_TARGET = 0.85  # prompt target; hard limit is 1.0
 
 
