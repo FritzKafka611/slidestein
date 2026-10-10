@@ -13,6 +13,7 @@ dependencies = [
     "lancedb>=0.13.0",
     "comtypes>=1.4.17",
     "sap-ai-sdk-gen>=7.4.1",
+    "pillow>=10.0.0",
 ]
 
 [project.scripts]

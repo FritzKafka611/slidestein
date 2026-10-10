@@ -2339,5 +2339,302 @@ def manager_review(
             raise typer.Exit(1) from exc
 
 
+@app.command("visual-qa")
+def visual_qa(
+    template_pptx: Path = typer.Option(
+        ...,
+        "--template-pptx",
+        help="Original selected library PPTX (template reference).",
+    ),
+    generated_pptx: Path = typer.Option(
+        ...,
+        "--generated-pptx",
+        help="M6 output PPTX to review.",
+    ),
+    draft_path: Path = typer.Option(
+        ...,
+        "--draft",
+        "-d",
+        help="Path to SlideContentDraft JSON file.",
+    ),
+    slot_map_path: Path = typer.Option(
+        ...,
+        "--slot-map",
+        "-s",
+        help="Path to TemplateSlotMap JSON file.",
+    ),
+    output: Optional[Path] = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help="Optional path to write VisualQAResult JSON.",
+    ),
+    artifacts_dir: Optional[Path] = typer.Option(
+        None,
+        "--artifacts-dir",
+        help="Directory for render PNGs and overlay (default: outputs/m8/<slide_id[:8]>).",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Render slides, run native checks, build overlay — no Vision call.",
+    ),
+) -> None:
+    """Visual QA: render-based presentation-readiness review of a generated PPTX.
+
+    Renders both generated and template slides, creates a K-key overlay, runs
+    native deterministic checks, then makes one SAP AI Core Vision call.
+    Use --dry-run to inspect without spending a Vision token.
+    """
+    from slidestein.drafting.models import SlideContentDraft  # noqa: PLC0415
+    from slidestein.drafting.service import build_slot_key_mapping  # noqa: PLC0415
+    from slidestein.qa.errors import VisualQAError  # noqa: PLC0415
+    from slidestein.qa.inspector import NativeVisualInspector  # noqa: PLC0415
+    from slidestein.qa.models import VisualQARequest  # noqa: PLC0415
+    from slidestein.qa.overlay import create_slot_overlay, read_live_slot_geometries  # noqa: PLC0415
+    from slidestein.qa.providers.factory import create_visual_qa_reviewer  # noqa: PLC0415
+    from slidestein.qa.providers.sap_aicore import VisualQAGenerationError  # noqa: PLC0415
+    from slidestein.qa.service import VisualQAService  # noqa: PLC0415
+    from slidestein.slots.models import TemplateSlotMap  # noqa: PLC0415
+
+    # Load draft
+    try:
+        draft = SlideContentDraft.model_validate_json(
+            draft_path.read_text(encoding="utf-8")
+        )
+    except Exception as exc:
+        console.print(f"[red]Failed to load draft:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    # Load slot map
+    try:
+        slot_map = TemplateSlotMap.model_validate_json(
+            slot_map_path.read_text(encoding="utf-8")
+        )
+    except Exception as exc:
+        console.print(f"[red]Failed to load slot map:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    if not template_pptx.exists():
+        console.print(f"[red]Template PPTX not found:[/red] {template_pptx}")
+        raise typer.Exit(1)
+
+    if not generated_pptx.exists():
+        console.print(f"[red]Generated PPTX not found:[/red] {generated_pptx}")
+        raise typer.Exit(1)
+
+    # Resolve artifacts directory
+    if artifacts_dir is None:
+        slide_short = slot_map.slide_id[:8]
+        artifacts_dir = Path("outputs") / "m8" / slide_short
+
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+    key_map = build_slot_key_mapping(slot_map.slots)
+
+    console.print(
+        f"\n[bold cyan]visual-qa[/bold cyan]  {slot_map.slide_id}  (#{slot_map.slide_number})"
+    )
+    console.print(f"  Generated: {generated_pptx}")
+    console.print(f"  Template:  {template_pptx}")
+    console.print(f"  Slots: {len(key_map)}  |  Draft: {'[green]COMPLETE[/green]' if draft.is_complete else '[yellow]INCOMPLETE[/yellow]'}")
+
+    if dry_run:
+        # --- Dry run: render + overlay + native checks, no Vision call ---
+        from slidestein.pptx.python_pptx_adapter import PythonPptxAdapter  # noqa: PLC0415
+
+        if not draft.is_complete:
+            console.print("[yellow]Warning:[/yellow] Draft is not complete — dry run continues anyway.")
+
+        # Resolve slide numbers
+        from slidestein.writeback.errors import PowerPointWritebackError  # noqa: PLC0415
+        from slidestein.writeback.preflight import resolve_slide_by_stable_id  # noqa: PLC0415
+
+        if not slot_map.deck_id:
+            console.print("[red]Error:[/red] slot_map.deck_id is required for stable slide targeting.")
+            raise typer.Exit(1)
+
+        try:
+            gen_slide_num, _ = resolve_slide_by_stable_id(
+                generated_pptx, slot_map.deck_id, slot_map.slide_id
+            )
+            tpl_slide_num, _ = resolve_slide_by_stable_id(
+                template_pptx, slot_map.deck_id, slot_map.slide_id
+            )
+        except PowerPointWritebackError as exc:
+            console.print(f"[red]Slide resolution failed:[/red] {exc}")
+            raise typer.Exit(1) from exc
+
+        console.print(f"  Generated slide ordinal: {gen_slide_num}")
+        console.print(f"  Template slide ordinal:  {tpl_slide_num}")
+
+        # Render
+        adapter = PythonPptxAdapter()
+        gen_png = artifacts_dir / "generated.png"
+        tpl_png = artifacts_dir / "template.png"
+        overlay_png = artifacts_dir / "overlay.png"
+        try:
+            adapter.render_preview(generated_pptx, gen_slide_num, gen_png)
+            console.print(f"  Generated render: [dim]{gen_png}[/dim]")
+        except Exception as exc:
+            console.print(f"[red]Render failed (generated):[/red] {exc}")
+            raise typer.Exit(1) from exc
+        try:
+            adapter.render_preview(template_pptx, tpl_slide_num, tpl_png)
+            console.print(f"  Template render:  [dim]{tpl_png}[/dim]")
+        except Exception as exc:
+            console.print(f"[red]Render failed (template):[/red] {exc}")
+            raise typer.Exit(1) from exc
+
+        # Overlay (using live generated geometry)
+        try:
+            live_geos = read_live_slot_geometries(generated_pptx, gen_slide_num, key_map)
+            create_slot_overlay(gen_png, overlay_png, live_geos)
+            console.print(f"  Overlay:          [dim]{overlay_png}[/dim]")
+        except Exception as exc:
+            console.print(f"[red]Overlay failed:[/red] {exc}")
+            raise typer.Exit(1) from exc
+
+        # Native checks
+        inspector = NativeVisualInspector()
+        try:
+            checks = inspector.inspect(generated_pptx, gen_slide_num, key_map, slot_map)
+        except Exception as exc:
+            console.print(f"[red]Native inspection failed:[/red] {exc}")
+            raise typer.Exit(1) from exc
+
+        console.print(f"\n  [bold]K-key mapping ({len(key_map)} slots):[/bold]")
+        for key, slot in key_map.items():
+            console.print(
+                f"    {key:<5}  {slot.slot_role.value:<20}  {_safe_text(slot.semantic_label)}"
+            )
+
+        console.print(f"\n  [bold]Native checks ({len(checks)}):[/bold]")
+        pass_count = sum(1 for c in checks if c.status.value == "pass")
+        fail_count = sum(1 for c in checks if c.status.value == "fail")
+        unk_count = sum(1 for c in checks if c.status.value == "unknown")
+        console.print(f"    pass={pass_count}  fail={fail_count}  unknown={unk_count}")
+        for chk in checks:
+            if chk.status.value == "fail":
+                console.print(
+                    f"    [red]FAIL[/red]  {chk.slot_key or 'slide'}  "
+                    f"{chk.check_type.value}  {_safe_text(chk.details[:100])}"
+                )
+
+        console.print("\n[dim]Dry run complete — no Vision call made.[/dim]")
+        return
+
+    # --- Full review ---
+    if not draft.is_complete:
+        console.print(
+            "[red]Error:[/red] Draft is not complete (is_complete=False). "
+            "Visual QA requires a fully complete draft."
+        )
+        raise typer.Exit(1)
+
+    from slidestein.config import get_settings  # noqa: PLC0415
+    from slidestein.pptx.python_pptx_adapter import PythonPptxAdapter  # noqa: PLC0415
+
+    settings = get_settings()
+    try:
+        reviewer = create_visual_qa_reviewer(settings)
+    except ValueError as exc:
+        console.print(f"[red]Reviewer configuration error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    class _AdapterRenderer:
+        def render(self, pptx_path: Path, slide_number: int, output_path: Path) -> None:
+            PythonPptxAdapter().render_preview(pptx_path, slide_number, output_path)
+
+    class _OverlayBuilderImpl:
+        def build(self, source_image: Path, output_path: Path, slot_key_map: dict) -> None:
+            create_slot_overlay(source_image, output_path, slot_key_map)
+
+    service = VisualQAService(
+        reviewer=reviewer,
+        renderer=_AdapterRenderer(),
+        overlay_builder=_OverlayBuilderImpl(),
+        native_inspector=NativeVisualInspector(),
+    )
+
+    request = VisualQARequest(
+        template_pptx=template_pptx,
+        generated_pptx=generated_pptx,
+        draft=draft,
+        slot_map=slot_map,
+    )
+
+    try:
+        result = service.review(request, artifacts_dir)
+    except VisualQAError as exc:
+        console.print(f"[red]Visual QA failed:[/red] {exc}")
+        raise typer.Exit(1) from exc
+    except VisualQAGenerationError as exc:
+        console.print(f"[red]Visual QA failed:[/red] {exc}")
+        raise typer.Exit(1) from exc
+    except Exception as exc:
+        console.print(f"[red]Unexpected error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    # Display result
+    if result.recommendation == "pass":
+        rec_display = "[green]PASS[/green]"
+    else:
+        rec_display = "[red]REVISE[/red]"
+
+    console.print(f"\n  Visual QA:       {rec_display}")
+    console.print(f"  Average score:   {result.average_score:.2f} / 5.00")
+
+    console.print("\n  [bold]Dimension scores:[/bold]")
+    dimensions = [
+        ("Text fit & clipping",     result.text_fit_and_clipping),
+        ("Visual hierarchy",        result.visual_hierarchy),
+        ("Alignment & spacing",     result.alignment_and_spacing),
+        ("Balance & whitespace",    result.balance_and_whitespace),
+        ("Typography consistency",  result.typography_and_style_consistency),
+        ("Overall readability",     result.overall_readability),
+    ]
+    for dim_name, dim in dimensions:
+        score_color = "green" if dim.score >= 4 else ("yellow" if dim.score == 3 else "red")
+        console.print(
+            f"    {dim_name:<26}  [{score_color}]{dim.score}[/{score_color}]"
+        )
+
+    if result.issues:
+        console.print(f"\n  [bold]Issues ({len(result.issues)}):[/bold]")
+        for issue in result.issues:
+            sev_color = "red" if issue.severity == "critical" else (
+                "yellow" if issue.severity == "major" else "dim"
+            )
+            slot_ref = f" [{', '.join(issue.slot_keys)}]" if issue.slot_keys else ""
+            console.print(
+                f"    [{sev_color}]{issue.severity:<8}[/{sev_color}]"
+                f"  {issue.category}{slot_ref}"
+            )
+            console.print(f"      {_safe_text(issue.issue[:120])}")
+
+    n_pass = sum(1 for c in result.native_checks if c.status.value == "pass")
+    n_fail = sum(1 for c in result.native_checks if c.status.value == "fail")
+    n_unk = sum(1 for c in result.native_checks if c.status.value == "unknown")
+    console.print(
+        f"\n  Native checks: {n_pass} pass / {n_fail} fail / {n_unk} unknown"
+    )
+
+    console.print(f"\n  [bold]Executive summary:[/bold]")
+    console.print(f"  {_safe_text(result.executive_summary)}")
+
+    console.print(f"\n  Generated render: [dim]{result.generated_render_path}[/dim]")
+    console.print(f"  Template render:  [dim]{result.template_render_path}[/dim]")
+    console.print(f"  Overlay:          [dim]{result.overlay_render_path}[/dim]")
+
+    if output is not None:
+        try:
+            output.write_text(result.model_dump_json(indent=2), encoding="utf-8")
+            console.print(f"\n[green]Visual QA result written to:[/green] {output}")
+        except Exception as exc:
+            console.print(f"[red]Failed to write output:[/red] {exc}")
+            raise typer.Exit(1) from exc
+
+
 if __name__ == "__main__":
     app()
