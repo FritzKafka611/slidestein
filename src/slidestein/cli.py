@@ -2636,5 +2636,321 @@ def visual_qa(
             raise typer.Exit(1) from exc
 
 
+@app.command("revise-slide")
+def revise_slide(
+    brief_path: Path = typer.Option(
+        ...,
+        "--brief",
+        "-b",
+        help="Path to ConsultingSlideBrief JSON file.",
+    ),
+    draft_path: Path = typer.Option(
+        ...,
+        "--draft",
+        "-d",
+        help="Path to SlideContentDraft JSON file.",
+    ),
+    slot_map_path: Path = typer.Option(
+        ...,
+        "--slot-map",
+        "-s",
+        help="Path to TemplateSlotMap JSON file.",
+    ),
+    manager_review_path: Path = typer.Option(
+        ...,
+        "--manager-review",
+        help="Path to ManagerReviewResult JSON file.",
+    ),
+    visual_qa_path: Path = typer.Option(
+        ...,
+        "--visual-qa",
+        help="Path to VisualQAResult JSON file.",
+    ),
+    template_pptx: Path = typer.Option(
+        ...,
+        "--template-pptx",
+        help="Original selected library PPTX (used as write-back source).",
+    ),
+    output_pptx: Path = typer.Option(
+        ...,
+        "--output-pptx",
+        help="Destination path for the revised PPTX.",
+    ),
+    source_file: Optional[Path] = typer.Option(
+        None,
+        "--source-file",
+        help="Optional path to source material text file.",
+    ),
+    source_text: Optional[str] = typer.Option(
+        None,
+        "--source-text",
+        help="Optional inline source material text (mutually exclusive with --source-file).",
+    ),
+    output: Optional[Path] = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help="Optional path to write RevisionCycleResult JSON.",
+    ),
+    artifacts_dir: Optional[Path] = typer.Option(
+        None,
+        "--artifacts-dir",
+        help="Directory for M8 render PNGs (default: outputs/m9/<slide_id[:8]>).",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Compute route only — no API calls, no write-back.",
+    ),
+) -> None:
+    """Bounded revision orchestration: route, revise (if needed), re-review, stop (M9).
+
+    Reads M7 manager review + M8 visual QA results, determines the revision route,
+    and (for content_revision) makes at most 3 API calls: 1 content text + 1 M7 + 1 M8 Vision.
+
+    Use --dry-run to see the route without spending any API calls.
+    """
+    from slidestein.briefing.brief import ConsultingSlideBrief  # noqa: PLC0415
+    from slidestein.drafting.models import SlideContentDraft  # noqa: PLC0415
+    from slidestein.qa.models import VisualQAResult  # noqa: PLC0415
+    from slidestein.review.models import ManagerReviewResult  # noqa: PLC0415
+    from slidestein.revision.errors import RevisionError  # noqa: PLC0415
+    from slidestein.revision.models import RevisionRequest, RevisionRoute  # noqa: PLC0415
+    from slidestein.revision.router import RevisionRouter  # noqa: PLC0415
+    from slidestein.slots.models import TemplateSlotMap  # noqa: PLC0415
+
+    if source_file is not None and source_text is not None:
+        console.print("[red]Error:[/red] --source-file and --source-text are mutually exclusive.")
+        raise typer.Exit(1)
+
+    # Load brief
+    try:
+        brief = ConsultingSlideBrief.model_validate_json(
+            brief_path.read_text(encoding="utf-8")
+        )
+    except Exception as exc:
+        console.print(f"[red]Failed to load brief:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    # Load draft
+    try:
+        draft = SlideContentDraft.model_validate_json(
+            draft_path.read_text(encoding="utf-8")
+        )
+    except Exception as exc:
+        console.print(f"[red]Failed to load draft:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    # Load slot map
+    try:
+        slot_map = TemplateSlotMap.model_validate_json(
+            slot_map_path.read_text(encoding="utf-8")
+        )
+    except Exception as exc:
+        console.print(f"[red]Failed to load slot map:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    # Load manager review (strip extra fields if present)
+    try:
+        mr_raw = __import__("json").loads(
+            manager_review_path.read_text(encoding="utf-8")
+        )
+        _EXTRA_MR_FIELDS = {"case", "slide"}
+        for fld in _EXTRA_MR_FIELDS:
+            mr_raw.pop(fld, None)
+        manager_review = ManagerReviewResult.model_validate(mr_raw)
+    except Exception as exc:
+        console.print(f"[red]Failed to load manager review:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    # Load visual QA result
+    try:
+        visual_qa = VisualQAResult.model_validate_json(
+            visual_qa_path.read_text(encoding="utf-8")
+        )
+    except Exception as exc:
+        console.print(f"[red]Failed to load visual QA:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    # Load source material
+    material: Optional[str] = None
+    if source_file is not None:
+        try:
+            material = source_file.read_text(encoding="utf-8")
+        except Exception as exc:
+            console.print(f"[red]Failed to read source file:[/red] {exc}")
+            raise typer.Exit(1) from exc
+    elif source_text is not None:
+        material = source_text
+
+    # Build request
+    try:
+        request = RevisionRequest(
+            brief=brief,
+            draft=draft,
+            slot_map=slot_map,
+            manager_review=manager_review,
+            visual_qa=visual_qa,
+            source_material=material,
+            template_pptx=template_pptx,
+            output_pptx=output_pptx,
+        )
+    except Exception as exc:
+        console.print(f"[red]Invalid revision request:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    console.print(
+        f"\n[bold cyan]revise-slide[/bold cyan]  {slot_map.slide_id}  (#{slot_map.slide_number})"
+    )
+    console.print(f"  M7: {manager_review.recommendation}  M8: {visual_qa.recommendation}")
+
+    if dry_run:
+        # Compute route only — no API calls
+        router = RevisionRouter()
+        try:
+            plan = router.route(request)
+        except Exception as exc:
+            console.print(f"[red]Revision routing error:[/red] {exc}")
+            raise typer.Exit(1) from exc
+        route_colors = {
+            RevisionRoute.FINALIZE: "green",
+            RevisionRoute.CONTENT_REVISION: "cyan",
+            RevisionRoute.TEMPLATE_RESELECTION: "yellow",
+            RevisionRoute.MANUAL_REVIEW: "red",
+        }
+        color = route_colors.get(plan.route, "white")
+        console.print(
+            f"\n  Route: [{color}]{plan.route.value}[/{color}]"
+        )
+        for reason in plan.reasons:
+            console.print(f"  Reason: {_safe_text(reason)}")
+        if plan.target_slot_keys:
+            console.print(f"  Target keys: {plan.target_slot_keys}")
+        console.print("\n[dim]Dry run complete — no API calls made.[/dim]")
+        return
+
+    # Full run
+    from slidestein.config import get_settings  # noqa: PLC0415
+    from slidestein.pptx.python_pptx_adapter import PythonPptxAdapter  # noqa: PLC0415
+    from slidestein.qa.inspector import NativeVisualInspector  # noqa: PLC0415
+    from slidestein.qa.overlay import create_slot_overlay  # noqa: PLC0415
+    from slidestein.qa.providers.factory import create_visual_qa_reviewer  # noqa: PLC0415
+    from slidestein.qa.service import VisualQAService  # noqa: PLC0415
+    from slidestein.review.providers.factory import create_manager_reviewer  # noqa: PLC0415
+    from slidestein.review.service import ManagerReviewService  # noqa: PLC0415
+    from slidestein.revision.providers.factory import create_content_reviser  # noqa: PLC0415
+    from slidestein.revision.service import (  # noqa: PLC0415
+        BoundedRevisionOrchestrator,
+        ContentRevisionService,
+    )
+
+    if artifacts_dir is None:
+        slide_short = slot_map.slide_id[:8]
+        artifacts_dir = Path("outputs") / "m9" / slide_short
+
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+    settings = get_settings()
+
+    try:
+        reviser = create_content_reviser(settings)
+    except ValueError as exc:
+        console.print(f"[red]Reviser configuration error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    try:
+        m7_reviewer = create_manager_reviewer(settings)
+    except ValueError as exc:
+        console.print(f"[red]Manager reviewer configuration error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    try:
+        m8_reviewer = create_visual_qa_reviewer(settings)
+    except ValueError as exc:
+        console.print(f"[red]Visual QA reviewer configuration error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    class _AdapterRenderer:
+        def render(self, pptx_path: Path, slide_number: int, output_path: Path) -> None:
+            PythonPptxAdapter().render_preview(pptx_path, slide_number, output_path)
+
+    class _OverlayBuilderImpl:
+        def build(self, source_image: Path, output_path: Path, slot_key_map: dict) -> None:
+            create_slot_overlay(source_image, output_path, slot_key_map)
+
+    content_revision_svc = ContentRevisionService(reviser=reviser)
+    manager_review_svc = ManagerReviewService(reviewer=m7_reviewer)
+    visual_qa_svc = VisualQAService(
+        reviewer=m8_reviewer,
+        renderer=_AdapterRenderer(),
+        overlay_builder=_OverlayBuilderImpl(),
+        native_inspector=NativeVisualInspector(),
+    )
+
+    orchestrator = BoundedRevisionOrchestrator(
+        content_revision_service=content_revision_svc,
+        manager_review_service=manager_review_svc,
+        visual_qa_service=visual_qa_svc,
+        artifacts_dir=artifacts_dir,
+    )
+
+    try:
+        cycle_result = orchestrator.revise(request)
+    except RevisionError as exc:
+        console.print(f"[red]Revision failed:[/red] {exc}")
+        raise typer.Exit(1) from exc
+    except Exception as exc:
+        console.print(f"[red]Unexpected error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    # Display result
+    route_colors = {
+        RevisionRoute.FINALIZE: "green",
+        RevisionRoute.CONTENT_REVISION: "cyan",
+        RevisionRoute.TEMPLATE_RESELECTION: "yellow",
+        RevisionRoute.MANUAL_REVIEW: "red",
+    }
+    color = route_colors.get(cycle_result.route, "white")
+    console.print(f"\n  Route: [{color}]{cycle_result.route.value}[/{color}]")
+    total_calls = sum(cycle_result.model_calls.values())
+    console.print(f"  API calls made: {total_calls}  {cycle_result.model_calls}")
+
+    if cycle_result.route == RevisionRoute.CONTENT_REVISION:
+        if cycle_result.output_pptx:
+            console.print(f"  Revised PPTX: {cycle_result.output_pptx}")
+
+        if cycle_result.manager_review_after:
+            m7_rec = cycle_result.manager_review_after.recommendation
+            m7_color = "green" if m7_rec == "approve" else "red"
+            console.print(
+                f"  M7 after: [{m7_color}]{m7_rec.upper()}[/{m7_color}]"
+                f"  avg={cycle_result.manager_review_after.average_score:.2f}"
+            )
+
+        if cycle_result.visual_qa_after:
+            m8_rec = cycle_result.visual_qa_after.recommendation
+            m8_color = "green" if m8_rec == "pass" else "red"
+            console.print(
+                f"  M8 after: [{m8_color}]{m8_rec.upper()}[/{m8_color}]"
+                f"  avg={cycle_result.visual_qa_after.average_score:.2f}"
+            )
+
+        ready_color = "green" if cycle_result.final_ready else "yellow"
+        console.print(
+            f"  Final ready: [{ready_color}]{'YES' if cycle_result.final_ready else 'NO'}[/{ready_color}]"
+        )
+    else:
+        for reason in cycle_result.plan.reasons:
+            console.print(f"  Reason: {_safe_text(reason)}")
+
+    if output is not None:
+        try:
+            output.write_text(cycle_result.model_dump_json(indent=2), encoding="utf-8")
+            console.print(f"\n[green]Revision result written to:[/green] {output}")
+        except Exception as exc:
+            console.print(f"[red]Failed to write output:[/red] {exc}")
+            raise typer.Exit(1) from exc
+
+
 if __name__ == "__main__":
     app()
