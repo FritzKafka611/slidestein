@@ -54,6 +54,9 @@ class Settings(BaseSettings):
 
     # Content revision provider (M9): "sap_ai_core"
     content_revision_provider: str = "sap_ai_core"
+
+    # Structural recovery provider (M10): "sap_ai_core"
+    structural_recovery_provider: str = "sap_ai_core"
     # sap_ai_core_model (shared with reranking/briefing/classification) is the
     # model used for all SAP AI Core Orchestration V2 calls including slot
     # analysis Vision.  sap_ai_core_vision_model was removed (was unused and

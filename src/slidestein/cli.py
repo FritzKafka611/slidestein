@@ -2952,5 +2952,374 @@ def revise_slide(
             raise typer.Exit(1) from exc
 
 
+@app.command("recover-slide")
+def recover_slide(
+    brief_path: Path = typer.Option(
+        ...,
+        "--brief",
+        "-b",
+        help="Path to ConsultingSlideBrief JSON file.",
+    ),
+    draft_path: Path = typer.Option(
+        ...,
+        "--draft",
+        "-d",
+        help="Path to SlideContentDraft JSON file.",
+    ),
+    slot_map_path: Path = typer.Option(
+        ...,
+        "--slot-map",
+        "-s",
+        help="Path to TemplateSlotMap JSON file.",
+    ),
+    manager_review_path: Path = typer.Option(
+        ...,
+        "--manager-review",
+        help="Path to ManagerReviewResult JSON file.",
+    ),
+    visual_qa_path: Path = typer.Option(
+        ...,
+        "--visual-qa",
+        help="Path to VisualQAResult JSON file.",
+    ),
+    m9_plan_path: Path = typer.Option(
+        ...,
+        "--m9-plan",
+        help="Path to RevisionPlan JSON file from M9.",
+    ),
+    template_pptx: Path = typer.Option(
+        ...,
+        "--template-pptx",
+        help="Original selected library PPTX (template source).",
+    ),
+    generated_pptx: Path = typer.Option(
+        ...,
+        "--generated-pptx",
+        help="Path to the generated PPTX that failed structural QA.",
+    ),
+    output_pptx: Path = typer.Option(
+        ...,
+        "--output-pptx",
+        help="Destination path for the recovered PPTX.",
+    ),
+    source_file: Optional[Path] = typer.Option(
+        None,
+        "--source-file",
+        help="Optional path to source material text file.",
+    ),
+    source_text: Optional[str] = typer.Option(
+        None,
+        "--source-text",
+        help="Optional inline source material text (mutually exclusive with --source-file).",
+    ),
+    output: Optional[Path] = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help="Optional path to write StructuralRecoveryResult JSON.",
+    ),
+    artifacts_dir: Optional[Path] = typer.Option(
+        None,
+        "--artifacts-dir",
+        help="Directory for render PNGs (default: outputs/m10/<slide_id[:8]>).",
+    ),
+    overwrite: bool = typer.Option(
+        False,
+        "--overwrite",
+        help="Overwrite output-pptx if it exists.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Diagnose route only — no API calls, no write-back.",
+    ),
+) -> None:
+    """Structural recovery: rebuild or reselect template to fix structural issues (M10).
+
+    Only accepts M9 escalations with route=template_reselection.
+    Makes at most 5 API calls for reselect (embedding + selection + draft + M7 + M8),
+    or 1 API call for rebuild (M8 Vision only).
+
+    Use --dry-run to diagnose the structural route without any API calls.
+    """
+    from slidestein.briefing.brief import ConsultingSlideBrief  # noqa: PLC0415
+    from slidestein.drafting.models import SlideContentDraft  # noqa: PLC0415
+    from slidestein.qa.models import VisualQAResult  # noqa: PLC0415
+    from slidestein.review.models import ManagerReviewResult  # noqa: PLC0415
+    from slidestein.revision.models import RevisionPlan  # noqa: PLC0415
+    from slidestein.slots.models import TemplateSlotMap  # noqa: PLC0415
+    from slidestein.structural.errors import (  # noqa: PLC0415
+        StructuralRecoveryError,
+        StructuralRecoveryExecutionError,
+    )
+    from slidestein.structural.models import (  # noqa: PLC0415
+        StructuralRecoveryRequest,
+        StructuralRecoveryRoute,
+    )
+
+    if source_file is not None and source_text is not None:
+        console.print("[red]Error:[/red] --source-file and --source-text are mutually exclusive.")
+        raise typer.Exit(1)
+
+    # Load brief
+    try:
+        brief = ConsultingSlideBrief.model_validate_json(
+            brief_path.read_text(encoding="utf-8")
+        )
+    except Exception as exc:
+        console.print(f"[red]Failed to load brief:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    # Load draft
+    try:
+        draft = SlideContentDraft.model_validate_json(
+            draft_path.read_text(encoding="utf-8")
+        )
+    except Exception as exc:
+        console.print(f"[red]Failed to load draft:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    # Load slot map
+    try:
+        slot_map = TemplateSlotMap.model_validate_json(
+            slot_map_path.read_text(encoding="utf-8")
+        )
+    except Exception as exc:
+        console.print(f"[red]Failed to load slot map:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    # Load manager review
+    try:
+        manager_review = ManagerReviewResult.model_validate_json(
+            manager_review_path.read_text(encoding="utf-8")
+        )
+    except Exception as exc:
+        console.print(f"[red]Failed to load manager review:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    # Load visual QA
+    try:
+        visual_qa_result = VisualQAResult.model_validate_json(
+            visual_qa_path.read_text(encoding="utf-8")
+        )
+    except Exception as exc:
+        console.print(f"[red]Failed to load visual QA result:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    # Load M9 plan
+    try:
+        m9_plan = RevisionPlan.model_validate_json(
+            m9_plan_path.read_text(encoding="utf-8")
+        )
+    except Exception as exc:
+        console.print(f"[red]Failed to load M9 plan:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    # Resolve source material
+    source_material: Optional[str] = None
+    if source_file is not None:
+        try:
+            source_material = source_file.read_text(encoding="utf-8")
+        except Exception as exc:
+            console.print(f"[red]Failed to read source file:[/red] {exc}")
+            raise typer.Exit(1) from exc
+    elif source_text is not None:
+        source_material = source_text
+
+    request = StructuralRecoveryRequest(
+        brief=brief,
+        source_material=source_material,
+        current_draft=draft,
+        current_slot_map=slot_map,
+        manager_review=manager_review,
+        visual_qa=visual_qa_result,
+        m9_plan=m9_plan,
+        template_pptx=template_pptx,
+        generated_pptx=generated_pptx,
+        output_pptx=output_pptx,
+        overwrite=overwrite,
+    )
+
+    # ---- Dry-run: diagnose only (zero API calls) ----
+    if dry_run:
+        from slidestein.structural.diagnosis import StructuralDiagnosisService  # noqa: PLC0415
+        try:
+            svc = StructuralDiagnosisService()
+            plan = svc.diagnose(request)
+        except StructuralRecoveryError as exc:
+            console.print(f"[red]Diagnosis failed:[/red] {exc}")
+            raise typer.Exit(1) from exc
+
+        route_colors = {
+            StructuralRecoveryRoute.REBUILD_CURRENT_TEMPLATE: "yellow",
+            StructuralRecoveryRoute.RESELECT_TEMPLATE: "cyan",
+            StructuralRecoveryRoute.MANUAL_REVIEW: "red",
+        }
+        color = route_colors.get(plan.route, "white")
+        console.print(f"\n[bold]Dry-run — structural diagnosis only[/bold]")
+        console.print(f"  Route : [{color}]{plan.route.value}[/{color}]")
+        console.print(f"  Drifts: {len(plan.structural_drifts)}")
+        for reason in plan.reasons:
+            console.print(f"  Reason: {_safe_text(reason)}")
+        for drift in plan.structural_drifts:
+            console.print(
+                f"    Drift [{drift.key}] {drift.drift_type}: "
+                f"template={drift.template_geometry} "
+                f"generated={drift.generated_geometry}"
+            )
+        console.print("\n[dim]No API calls made (--dry-run).[/dim]")
+        return
+
+    # ---- Full run ----
+    from slidestein.config import get_settings  # noqa: PLC0415
+    from slidestein.drafting.providers.factory import create_content_draft_generator  # noqa: PLC0415
+    from slidestein.drafting.service import SlideContentDraftService  # noqa: PLC0415
+    from slidestein.library.store import SlideLibrary  # noqa: PLC0415
+    from slidestein.qa.inspector import NativeVisualInspector  # noqa: PLC0415
+    from slidestein.qa.overlay import create_slot_overlay  # noqa: PLC0415
+    from slidestein.qa.providers.factory import create_visual_qa_reviewer  # noqa: PLC0415
+    from slidestein.qa.service import VisualQAService  # noqa: PLC0415
+    from slidestein.pptx.python_pptx_adapter import PythonPptxAdapter  # noqa: PLC0415
+    from slidestein.retrieval.hybrid import HybridSlideSearch  # noqa: PLC0415
+    from slidestein.retrieval.providers.factory import create_embedding_provider  # noqa: PLC0415
+    from slidestein.retrieval.store import SlideVectorStore  # noqa: PLC0415
+    from slidestein.review.providers.factory import create_manager_reviewer  # noqa: PLC0415
+    from slidestein.review.service import ManagerReviewService  # noqa: PLC0415
+    from slidestein.structural.orchestrator import StructuralRecoveryOrchestrator  # noqa: PLC0415
+    from slidestein.structural.providers.factory import (  # noqa: PLC0415
+        create_structural_template_selector,
+    )
+    from slidestein.writeback.service import PowerPointWritebackService  # noqa: PLC0415
+
+    settings = get_settings()
+
+    # Resolve artifacts directory
+    _art_dir = artifacts_dir
+    if _art_dir is None:
+        _art_dir = Path("outputs") / "m10" / slot_map.slide_id[:8]
+    _art_dir.mkdir(parents=True, exist_ok=True)
+
+    # Build all services
+    try:
+        embedding_provider = create_embedding_provider(settings)
+        vector_store = SlideVectorStore(settings.lancedb_uri)
+        searcher = HybridSlideSearch(provider=embedding_provider, store=vector_store)
+    except ValueError as exc:
+        console.print(f"[red]Embedding provider error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    try:
+        selector = create_structural_template_selector(settings)
+    except (ValueError, RuntimeError) as exc:
+        console.print(f"[red]Structural selector configuration error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    try:
+        m5_generator = create_content_draft_generator(settings)
+    except ValueError as exc:
+        console.print(f"[red]Content draft provider error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    try:
+        m7_reviewer = create_manager_reviewer(settings)
+    except ValueError as exc:
+        console.print(f"[red]Manager reviewer configuration error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    try:
+        m8_reviewer = create_visual_qa_reviewer(settings)
+    except ValueError as exc:
+        console.print(f"[red]Visual QA reviewer configuration error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    class _AdapterRenderer:
+        def render(self, pptx_path: Path, slide_number: int, output_path: Path) -> None:
+            PythonPptxAdapter().render_preview(pptx_path, slide_number, output_path)
+
+    class _OverlayBuilderImpl:
+        def build(self, source_image: Path, output_path: Path, slot_key_map: dict) -> None:
+            create_slot_overlay(source_image, output_path, slot_key_map)
+
+    with SlideLibrary(settings.db_path, settings.lancedb_uri) as library:
+        drafting_svc = SlideContentDraftService(generator=m5_generator)
+        manager_review_svc = ManagerReviewService(reviewer=m7_reviewer)
+        visual_qa_svc = VisualQAService(
+            reviewer=m8_reviewer,
+            renderer=_AdapterRenderer(),
+            overlay_builder=_OverlayBuilderImpl(),
+            native_inspector=NativeVisualInspector(),
+        )
+        writeback_svc = PowerPointWritebackService()
+
+        orchestrator = StructuralRecoveryOrchestrator(
+            searcher=searcher,
+            library=library,
+            selector=selector,
+            drafting_service=drafting_svc,
+            writeback_service=writeback_svc,
+            manager_review_service=manager_review_svc,
+            visual_qa_service=visual_qa_svc,
+            renderer=_AdapterRenderer(),
+        )
+
+        console.print("[bold cyan]SlideStein M10[/bold cyan]  structural recovery…")
+        console.print(f"  Slide  : {slot_map.slide_id}")
+        console.print(f"  M9 route: {m9_plan.route.value}")
+
+        try:
+            result = orchestrator.recover(request, _art_dir)
+        except StructuralRecoveryError as exc:
+            console.print(f"[red]Structural recovery failed:[/red] {exc}")
+            raise typer.Exit(1) from exc
+        except Exception as exc:
+            console.print(f"[red]Unexpected error:[/red] {exc}")
+            raise typer.Exit(1) from exc
+
+    # Display result
+    route_colors = {
+        StructuralRecoveryRoute.REBUILD_CURRENT_TEMPLATE: "yellow",
+        StructuralRecoveryRoute.RESELECT_TEMPLATE: "cyan",
+        StructuralRecoveryRoute.MANUAL_REVIEW: "red",
+    }
+    color = route_colors.get(result.route, "white")
+    console.print(f"\n  Route : [{color}]{result.route.value}[/{color}]")
+    console.print(f"  Status: {result.status}")
+    total_calls = sum(result.model_calls.values())
+    console.print(f"  API calls: {total_calls}  {result.model_calls}")
+
+    effective = result.manager_review_effective
+    m7_color = "green" if effective.recommendation == "approve" else "red"
+    console.print(
+        f"  M7 effective: [{m7_color}]{effective.recommendation.upper()}[/{m7_color}]"
+        f"  avg={effective.average_score:.2f}"
+    )
+
+    if result.visual_qa_after:
+        m8_color = "green" if result.visual_qa_after.recommendation == "pass" else "red"
+        console.print(
+            f"  M8 after: [{m8_color}]{result.visual_qa_after.recommendation.upper()}[/{m8_color}]"
+            f"  avg={result.visual_qa_after.average_score:.2f}"
+        )
+
+    ready_color = "green" if result.final_ready else "yellow"
+    console.print(
+        f"  Final ready: [{ready_color}]{'YES' if result.final_ready else 'NO'}[/{ready_color}]"
+    )
+
+    if result.selected_candidate:
+        console.print(f"  Selected: {_safe_text(result.selected_candidate.slide_id)}")
+
+    if result.output_pptx:
+        console.print(f"  Output PPTX: {result.output_pptx}")
+
+    if output is not None:
+        try:
+            output.write_text(result.model_dump_json(indent=2), encoding="utf-8")
+            console.print(f"\n[green]Recovery result written to:[/green] {output}")
+        except Exception as exc:
+            console.print(f"[red]Failed to write output:[/red] {exc}")
+            raise typer.Exit(1) from exc
+
+
 if __name__ == "__main__":
     app()
