@@ -3321,5 +3321,85 @@ def recover_slide(
             raise typer.Exit(1) from exc
 
 
+@app.command("inspect-slide-state")
+def inspect_slide_state(
+    source: Path = typer.Argument(..., help="Path to PPTX file."),
+    slide: int = typer.Option(1, "--slide", "-s", help="Slide number (1-indexed)."),
+    include_text: bool = typer.Option(
+        False,
+        "--include-text",
+        help="Include text content in output (omitted by default for safety).",
+    ),
+    output: Optional[Path] = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help="Write full SlideState JSON to this file.",
+    ),
+) -> None:
+    """Capture and display slide state (developer debug tool).
+
+    Text content is omitted by default — pass --include-text to dump it.
+    Zero model or provider calls.
+    """
+    if not source.exists():
+        console.print(f"[red]File not found:[/red] {source}")
+        raise typer.Exit(1)
+    if slide < 1:
+        console.print("[red]Slide number must be >= 1[/red]")
+        raise typer.Exit(1)
+    from slidestein.interactive.adapters.python_pptx import (  # noqa: PLC0415
+        PythonPptxPowerPointHostAdapter,
+    )
+    from rich.table import Table  # noqa: PLC0415
+
+    adapter = PythonPptxPowerPointHostAdapter()
+    try:
+        state = adapter.capture_slide_state(source, slide_number=slide)
+    except Exception as exc:
+        console.print(f"[red]Failed to capture slide state:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    headers = ["path", "id", "type", "x", "y", "w", "h"]
+    if include_text:
+        headers.append("text")
+    headers.append("fingerprint")
+
+    table = Table(
+        title=f"Slide State — {source.name} slide {slide}",
+        show_header=True,
+    )
+    for h in headers:
+        table.add_column(h)
+
+    for s in sorted(state.shapes, key=lambda x: x.shape_path):
+        row = [
+            s.shape_path,
+            str(s.shape_id),
+            s.shape_type,
+            str(s.x),
+            str(s.y),
+            str(s.width),
+            str(s.height),
+        ]
+        if include_text:
+            row.append(_safe_text(s.text or ""))
+        row.append(s.formatting_fingerprint or "-")
+        table.add_row(*row)
+
+    console.print(table)
+    console.print(f"\n[bold]state_hash:[/bold] {state.state_hash}")
+    console.print(f"[bold]shapes:[/bold]     {len(state.shapes)}")
+    console.print(f"[bold]slide_size:[/bold] {state.slide_width} × {state.slide_height} EMU")
+
+    if output is not None:
+        try:
+            output.write_text(state.model_dump_json(indent=2), encoding="utf-8")
+            console.print(f"\n[green]State written to:[/green] {output}")
+        except Exception as exc:
+            console.print(f"[red]Failed to write output:[/red] {exc}")
+            raise typer.Exit(1) from exc
+
+
 if __name__ == "__main__":
     app()
